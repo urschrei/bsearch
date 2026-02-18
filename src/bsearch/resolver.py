@@ -66,6 +66,7 @@ class ATProtoResolver:
 
         await self._ensure_logged_in()
         posts = []
+        prev_cursor = None
         cursor = None
         count = 0
 
@@ -89,8 +90,9 @@ class ATProtoResolver:
                     if limit and count >= limit:
                         return posts
 
+            prev_cursor = cursor
             cursor = response.cursor
-            if not cursor:
+            if not cursor or cursor == prev_cursor:
                 break
 
         return posts
@@ -99,6 +101,7 @@ class ATProtoResolver:
         """Fetch historically liked posts."""
         await self._ensure_logged_in()
         posts = []
+        prev_cursor = None
         cursor = None
         count = 0
 
@@ -120,8 +123,9 @@ class ATProtoResolver:
                     if limit and count >= limit:
                         return posts
 
+            prev_cursor = cursor
             cursor = response.cursor
-            if not cursor:
+            if not cursor or cursor == prev_cursor:
                 break
 
         return posts
