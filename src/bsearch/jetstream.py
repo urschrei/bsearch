@@ -20,6 +20,24 @@ COLLECTIONS = [
 ]
 
 
+def _notify(title: str, message: str) -> None:
+    """Send a macOS notification via osascript."""
+    import subprocess
+
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{message}" with title "{title}"',
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        logger.debug("Failed to send notification", exc_info=True)
+
+
 class JetstreamClient:
     """WebSocket client for Bluesky Jetstream with auto-reconnection."""
 
@@ -72,14 +90,17 @@ class JetstreamClient:
             try:
                 async with websockets.connect(url) as ws:
                     logger.info("Connected to Jetstream")
+                    _notify("bsearch: connected", "Jetstream WebSocket connected.")
                     async for message in ws:
                         if not self._running:
                             break
                         self._process_message(message)
             except websockets.ConnectionClosed as e:
                 logger.warning("Jetstream connection closed: %s", e)
+                _notify("bsearch: disconnected", f"Connection closed: {e}")
             except Exception:
                 logger.exception("Jetstream connection error")
+                _notify("bsearch: error", "Jetstream connection error.")
 
             if self._running:
                 logger.info("Reconnecting in 5 seconds...")
