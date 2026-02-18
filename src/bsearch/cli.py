@@ -13,9 +13,12 @@ from bsearch.config import Config
 @click.group()
 @click.version_option(version=__version__, prog_name="bsearch")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging.")
-def cli(verbose: bool):
+@click.pass_context
+def cli(ctx, verbose: bool):
     """Bluesky post and like monitor with vector search."""
-    level = logging.DEBUG if verbose else logging.INFO
+    ctx.ensure_object(dict)
+    ctx.obj["verbose"] = verbose
+    level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -54,8 +57,11 @@ def init():
 
 
 @cli.command()
-def serve():
+@click.pass_context
+def serve(ctx):
     """Run the Jetstream listener (foreground)."""
+    if not ctx.obj.get("verbose"):
+        logging.getLogger().setLevel(logging.INFO)
 
     async def _serve():
         config = Config.from_env()
@@ -84,7 +90,7 @@ def search(query: str, limit: int, source: str | None):
     from bsearch.embeddings import Embedder
 
     db = Database(config.db_path)
-    embedder = Embedder(config.embedding_model)
+    embedder = Embedder(config.embedding_model, quiet=True)
 
     query_embedding = embedder.encode_single(query)
     results = db.search(query_embedding, limit=limit, source_filter=source)
@@ -95,11 +101,12 @@ def search(query: str, limit: int, source: str | None):
         return
 
     for i, r in enumerate(results, 1):
+        web_url = _at_uri_to_web_url(r["uri"])
         click.echo(f"\n--- Result {i} (distance: {r['distance']:.4f}) ---")
         click.echo(f"Author:  {r['author_handle']}")
         click.echo(f"Date:    {r['created_at']}")
         click.echo(f"Source:  {r['source']}")
-        click.echo(f"URI:     {r['uri']}")
+        click.echo(f"Link:    {web_url}")
         click.echo(f"Text:    {r['text']}")
 
     db.close()
@@ -107,8 +114,11 @@ def search(query: str, limit: int, source: str | None):
 
 @cli.command()
 @click.option("--limit", "-n", default=None, type=int, help="Max posts to fetch.")
-def backfill(limit: int | None):
+@click.pass_context
+def backfill(ctx, limit: int | None):
     """Fetch historical posts and likes via the AT Protocol API."""
+    if not ctx.obj.get("verbose"):
+        logging.getLogger().setLevel(logging.INFO)
 
     async def _backfill():
         config = Config.from_env()
@@ -203,6 +213,17 @@ def uninstall_service():
     from bsearch.launchd import uninstall_plist
 
     uninstall_plist()
+
+
+def _at_uri_to_web_url(uri: str) -> str:
+    """Convert an at:// URI to a clickable bsky.app URL."""
+    # at://did:plc:abc/app.bsky.feed.post/rkey -> https://bsky.app/profile/did:plc:abc/post/rkey
+    if not uri.startswith("at://"):
+        return uri
+    parts = uri.removeprefix("at://").split("/")
+    if len(parts) >= 3 and parts[1] == "app.bsky.feed.post":
+        return f"https://bsky.app/profile/{parts[0]}/post/{parts[2]}"
+    return uri
 
 
 if __name__ == "__main__":
