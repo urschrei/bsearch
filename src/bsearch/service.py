@@ -45,9 +45,11 @@ class Service:
         if not text:
             return
 
-        created_at_str = record.get("createdAt")
+        created_at_str = record.get("createdAt", "")
         try:
-            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            created_at = datetime.fromisoformat(
+                str(created_at_str).replace("Z", "+00:00")
+            )
         except (ValueError, TypeError, AttributeError):
             created_at = datetime.now()
 

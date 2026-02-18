@@ -89,7 +89,7 @@ class JetstreamClient:
         """Signal the client to stop."""
         self._running = False
 
-    def _process_message(self, raw: str) -> None:
+    def _process_message(self, raw: str | bytes) -> None:
         """Parse a raw Jetstream message and dispatch it."""
         from bsearch.models import JetstreamEvent
 
