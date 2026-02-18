@@ -78,3 +78,6 @@ When running as a launchd agent, logs are written to:
 ## Storage
 
 The database is stored as `bsearch.db` in the working directory (configurable via `BSEARCH_DB_PATH` in `.env`).
+
+# License
+[The Blue Oak Model License 1.0](LICENSE.md)
