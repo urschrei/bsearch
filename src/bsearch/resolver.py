@@ -18,7 +18,7 @@ class ATProtoResolver:
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.client = AsyncClient()
+        self.client = AsyncClient(base_url=config.pds_url)
         self._logged_in = False
 
     async def login(self) -> None:

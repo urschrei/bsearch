@@ -29,13 +29,24 @@ def init():
 
     async def _init():
         config = Config.from_env()
+        click.echo(f"Handle:  {config.handle}")
+        click.echo(f"PDS:     {config.pds_url}")
+
         from bsearch.resolver import ATProtoResolver
 
         resolver = ATProtoResolver(config)
-        await resolver.login()
+        try:
+            await resolver.login()
+        except Exception as e:
+            click.echo(f"Authentication failed: {e}", err=True)
+            click.echo(
+                "If your handle is on a custom PDS, set pds_url in .env "
+                "(e.g. pds_url: https://pds.example.com)",
+                err=True,
+            )
+            raise SystemExit(1) from e
         did = await resolver.resolve_handle(config.handle)
         config.did = did
-        click.echo(f"Handle:  {config.handle}")
         click.echo(f"DID:     {did}")
         click.echo("Authentication successful.")
 
