@@ -75,9 +75,12 @@ class ATProtoResolver:
             response = await self.client.get_author_feed(
                 actor=self.config.did or self.config.handle,
                 cursor=cursor,
-                filter="posts_no_replies",
+                filter="posts_with_replies",
                 limit=page_limit,
             )
+
+            if not response.feed:
+                break
 
             for feed_item in response.feed:
                 # Skip reposts
@@ -90,6 +93,12 @@ class ATProtoResolver:
                     if limit and count >= limit:
                         return posts
 
+            logger.info(
+                "Fetched page of %d items (%d posts so far, cursor: %s)",
+                len(response.feed),
+                count,
+                response.cursor,
+            )
             prev_cursor = cursor
             cursor = response.cursor
             if not cursor or cursor == prev_cursor:
@@ -115,6 +124,9 @@ class ATProtoResolver:
                 )
             )
 
+            if not response.feed:
+                break
+
             for feed_item in response.feed:
                 post = _post_view_to_post(feed_item.post, source="backfill_like")
                 if post is not None:
@@ -123,6 +135,12 @@ class ATProtoResolver:
                     if limit and count >= limit:
                         return posts
 
+            logger.info(
+                "Fetched page of %d likes (%d posts so far, cursor: %s)",
+                len(response.feed),
+                count,
+                response.cursor,
+            )
             prev_cursor = cursor
             cursor = response.cursor
             if not cursor or cursor == prev_cursor:
