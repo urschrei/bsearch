@@ -1,9 +1,11 @@
+import sqlite3
 from datetime import datetime
 
 import numpy as np
 import pytest
+import sqlite_vec
 
-from bsearch.db import Database
+from bsearch.db import SCHEMA_SQL, VEC_TABLE_SQL, Database
 from bsearch.models import Post
 
 
@@ -158,6 +160,88 @@ class TestFTSSearch:
         assert len(results) == 2
         # Post with more occurrences of "python" should rank higher
         assert results[0]["uri"] == "at://a/2"
+
+
+class TestFTSRebuild:
+    """Test that FTS works when upgrading an existing database that has
+    posts but was created before FTS support was added."""
+
+    def _create_old_schema_db(self, db_path):
+        """Create a database with the pre-FTS schema and insert posts."""
+        conn = sqlite3.connect(str(db_path))
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(SCHEMA_SQL)
+        conn.execute(VEC_TABLE_SQL)
+        conn.commit()
+        conn.execute(
+            "INSERT INTO posts "
+            "(uri, cid, author_did, author_handle, text, created_at, "
+            "source, indexed_at, has_embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "at://a/1",
+                "bafyreiabc",
+                "did:plc:abc",
+                "test.bsky.social",
+                "violence in the media is concerning",
+                "2025-01-01T00:00:00",
+                "own_post",
+                "2025-01-01T00:00:00",
+                0,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO posts "
+            "(uri, cid, author_did, author_handle, text, created_at, "
+            "source, indexed_at, has_embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "at://a/2",
+                "bafyreiabc2",
+                "did:plc:abc",
+                "test.bsky.social",
+                "cats are lovely animals",
+                "2025-01-01T00:00:00",
+                "own_post",
+                "2025-01-01T00:00:00",
+                0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_fts_rebuild_populates_index(self, tmp_path):
+        db_path = tmp_path / "upgrade.db"
+        self._create_old_schema_db(db_path)
+
+        db = Database(db_path)
+        results = db.search_fts("violence", limit=10)
+        assert len(results) == 1
+        assert "violence" in results[0]["text"]
+        db.close()
+
+    def test_fts_rebuild_only_runs_once(self, tmp_path):
+        db_path = tmp_path / "upgrade.db"
+        self._create_old_schema_db(db_path)
+
+        db = Database(db_path)
+        db.close()
+
+        # Second open should not rebuild (flag is set)
+        db2 = Database(db_path)
+        row = db2.conn.execute(
+            "SELECT value FROM meta WHERE key = 'fts_initialized'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "1"
+
+        # Search still works
+        results = db2.search_fts("cats", limit=10)
+        assert len(results) == 1
+        db2.close()
 
 
 class TestHybridSearch:

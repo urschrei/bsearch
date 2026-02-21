@@ -91,22 +91,25 @@ class Database:
         self.conn.commit()
 
     def _ensure_fts_populated(self) -> None:
-        """Rebuild the FTS index if it is out of sync with the posts table.
+        """Rebuild the FTS index if it has never been initialised.
 
-        This handles databases created before FTS support was added.
+        For external-content FTS5 tables, SELECT count(*) reads from the
+        content table rather than the index, so we cannot compare counts.
+        Instead we track a metadata flag that is set after the first rebuild.
         """
-        posts_count = self.conn.execute("SELECT count(*) FROM posts").fetchone()[0]
-        if posts_count == 0:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = 'fts_initialized'"
+        ).fetchone()
+        if row is not None:
             return
-        fts_count = self.conn.execute("SELECT count(*) FROM fts_posts").fetchone()[0]
-        if fts_count < posts_count:
-            logger.info(
-                "FTS index has %d entries but posts table has %d; rebuilding...",
-                fts_count,
-                posts_count,
-            )
+        posts_count = self.conn.execute("SELECT count(*) FROM posts").fetchone()[0]
+        if posts_count > 0:
+            logger.info("Rebuilding FTS index for %d posts...", posts_count)
             self.conn.execute("INSERT INTO fts_posts(fts_posts) VALUES('rebuild')")
             logger.info("FTS index rebuilt.")
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('fts_initialized', '1')"
+        )
 
     def insert_post(self, post: Post) -> int | None:
         """Insert a post, returning its id. Returns None if it already exists."""
