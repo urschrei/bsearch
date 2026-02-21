@@ -105,6 +105,122 @@ class TestCursor:
         assert db.get_cursor() == 200
 
 
+class TestFTSSearch:
+    def test_fts_finds_matching_text(self, db):
+        db.insert_post(_make_post(uri="at://a/1", text="the cat sat on the mat"))
+        db.insert_post(_make_post(uri="at://a/2", text="dogs playing in the park"))
+
+        results = db.search_fts("cat", limit=10)
+        assert len(results) == 1
+        assert "cat" in results[0]["text"]
+
+    def test_fts_no_results(self, db):
+        db.insert_post(_make_post(uri="at://a/1", text="hello world"))
+        results = db.search_fts("nonexistent", limit=10)
+        assert len(results) == 0
+
+    def test_fts_source_filter(self, db):
+        db.insert_post(
+            _make_post(uri="at://a/1", text="cats are great", source="own_post")
+        )
+        db.insert_post(
+            _make_post(uri="at://a/2", text="cats are wonderful", source="like")
+        )
+
+        results = db.search_fts("cats", limit=10, source_filter="own_post")
+        assert len(results) == 1
+        assert results[0]["source"] == "own_post"
+
+    def test_fts_porter_stemming(self, db):
+        db.insert_post(_make_post(uri="at://a/1", text="running quickly"))
+        results = db.search_fts("run", limit=10)
+        assert len(results) == 1
+
+    def test_fts_empty_query_returns_empty(self, db):
+        db.insert_post(_make_post(uri="at://a/1", text="hello world"))
+        assert db.search_fts("", limit=10) == []
+        assert db.search_fts("   ", limit=10) == []
+
+    def test_fts_special_characters_do_not_crash(self, db):
+        db.insert_post(_make_post(uri="at://a/1", text="hello world"))
+        # Special characters that would break FTS5 syntax should not raise
+        results = db.search_fts("hello (world", limit=10)
+        assert isinstance(results, list)
+
+    def test_fts_multiple_results_ranked(self, db):
+        db.insert_post(_make_post(uri="at://a/1", text="python programming language"))
+        db.insert_post(
+            _make_post(uri="at://a/2", text="python snake python reptile python")
+        )
+        db.insert_post(_make_post(uri="at://a/3", text="java programming"))
+
+        results = db.search_fts("python", limit=10)
+        assert len(results) == 2
+        # Post with more occurrences of "python" should rank higher
+        assert results[0]["uri"] == "at://a/2"
+
+
+class TestHybridSearch:
+    def test_hybrid_returns_results_from_both(self, db):
+        id1 = db.insert_post(
+            _make_post(uri="at://a/1", text="learning python programming")
+        )
+        id2 = db.insert_post(
+            _make_post(uri="at://a/2", text="machine learning is fascinating")
+        )
+
+        emb1 = np.random.randn(384).astype(np.float32)
+        emb2 = np.random.randn(384).astype(np.float32)
+        db.store_embeddings([(id1, emb1), (id2, emb2)])
+
+        results = db.search_hybrid("python", emb1, limit=10)
+        assert len(results) >= 1
+        # Post 1 matches both keyword ("python") and vector (emb1)
+        assert results[0]["id"] == id1
+        assert results[0]["match_type"] == "keyword+semantic"
+
+    def test_hybrid_fts_only_fallback(self, db):
+        db.insert_post(_make_post(uri="at://a/1", text="specific keyword here"))
+        results = db.search_hybrid("keyword", query_embedding=None, limit=10)
+        assert len(results) == 1
+        assert results[0]["match_type"] == "keyword"
+
+    def test_hybrid_vector_only_fallback(self, db):
+        id1 = db.insert_post(_make_post(uri="at://a/1", text="hello world"))
+        emb1 = np.random.randn(384).astype(np.float32)
+        db.store_embeddings([(id1, emb1)])
+
+        results = db.search_hybrid("zzzznonexistent", emb1, limit=10)
+        assert len(results) >= 1
+
+    def test_hybrid_deduplication(self, db):
+        id1 = db.insert_post(_make_post(uri="at://a/1", text="unique test post"))
+        emb1 = np.random.randn(384).astype(np.float32)
+        db.store_embeddings([(id1, emb1)])
+
+        results = db.search_hybrid("unique test", emb1, limit=10)
+        ids = [r["id"] for r in results]
+        assert len(ids) == len(set(ids))
+
+    def test_hybrid_source_filter(self, db):
+        id1 = db.insert_post(
+            _make_post(uri="at://a/1", text="cats everywhere", source="own_post")
+        )
+        id2 = db.insert_post(
+            _make_post(uri="at://a/2", text="cats are nice", source="like")
+        )
+        emb = np.random.randn(384).astype(np.float32)
+        db.store_embeddings([(id1, emb), (id2, emb)])
+
+        results = db.search_hybrid("cats", emb, limit=10, source_filter="own_post")
+        assert all(r["source"] == "own_post" for r in results)
+
+    def test_hybrid_empty_db(self, db):
+        emb = np.random.randn(384).astype(np.float32)
+        results = db.search_hybrid("anything", emb, limit=10)
+        assert results == []
+
+
 class TestStats:
     def test_empty_stats(self, db):
         stats = db.get_stats()

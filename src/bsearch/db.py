@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -9,6 +10,8 @@ import sqlite_vec
 
 if TYPE_CHECKING:
     from bsearch.models import Post
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -39,6 +42,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_posts USING vec0(
 );
 """
 
+FTS_SCHEMA_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_posts USING fts5(
+    text,
+    content=posts,
+    content_rowid=id,
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS posts_ai AFTER INSERT ON posts BEGIN
+    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS posts_ad AFTER DELETE ON posts BEGIN
+    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS posts_au AFTER UPDATE ON posts BEGIN
+    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
+    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+END;
+"""
+
 
 class Database:
     """SQLite + sqlite-vec database layer."""
@@ -61,7 +86,27 @@ class Database:
     def _init_schema(self) -> None:
         self.conn.executescript(SCHEMA_SQL)
         self.conn.execute(VEC_TABLE_SQL)
+        self.conn.executescript(FTS_SCHEMA_SQL)
+        self._ensure_fts_populated()
         self.conn.commit()
+
+    def _ensure_fts_populated(self) -> None:
+        """Rebuild the FTS index if it is out of sync with the posts table.
+
+        This handles databases created before FTS support was added.
+        """
+        posts_count = self.conn.execute("SELECT count(*) FROM posts").fetchone()[0]
+        if posts_count == 0:
+            return
+        fts_count = self.conn.execute("SELECT count(*) FROM fts_posts").fetchone()[0]
+        if fts_count < posts_count:
+            logger.info(
+                "FTS index has %d entries but posts table has %d; rebuilding...",
+                fts_count,
+                posts_count,
+            )
+            self.conn.execute("INSERT INTO fts_posts(fts_posts) VALUES('rebuild')")
+            logger.info("FTS index rebuilt.")
 
     def insert_post(self, post: Post) -> int | None:
         """Insert a post, returning its id. Returns None if it already exists."""
@@ -153,6 +198,144 @@ class Database:
         if source_filter:
             results = [r for r in results if r["source"] == source_filter]
         return results[:limit]
+
+    def search_fts(
+        self,
+        query: str,
+        limit: int = 10,
+        source_filter: str | None = None,
+    ) -> list[dict]:
+        """Full-text search using FTS5 BM25 ranking.
+
+        Returns results ordered by BM25 relevance (best first).
+        If the query causes an FTS5 syntax error, returns an empty list.
+        """
+        if not query or not query.strip():
+            return []
+        try:
+            if source_filter:
+                rows = self.conn.execute(
+                    """
+                    SELECT
+                        p.id,
+                        fts_posts.rank AS bm25_rank,
+                        p.uri,
+                        p.cid,
+                        p.author_did,
+                        p.author_handle,
+                        p.text,
+                        p.created_at,
+                        p.source,
+                        p.indexed_at
+                    FROM fts_posts
+                    INNER JOIN posts p ON p.id = fts_posts.rowid
+                    WHERE fts_posts MATCH ?
+                        AND p.source = ?
+                    ORDER BY fts_posts.rank
+                    LIMIT ?
+                    """,
+                    (query, source_filter, limit),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """
+                    SELECT
+                        p.id,
+                        fts_posts.rank AS bm25_rank,
+                        p.uri,
+                        p.cid,
+                        p.author_did,
+                        p.author_handle,
+                        p.text,
+                        p.created_at,
+                        p.source,
+                        p.indexed_at
+                    FROM fts_posts
+                    INNER JOIN posts p ON p.id = fts_posts.rowid
+                    WHERE fts_posts MATCH ?
+                    ORDER BY fts_posts.rank
+                    LIMIT ?
+                    """,
+                    (query, limit),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            logger.debug("FTS query failed for %r, retrying as phrase", query)
+            try:
+                return self.search_fts(
+                    f'"{query}"', limit=limit, source_filter=source_filter
+                )
+            except sqlite3.OperationalError:
+                logger.debug("FTS phrase query also failed for %r", query)
+                return []
+        return [dict(row) for row in rows]
+
+    def search_hybrid(
+        self,
+        query: str,
+        query_embedding: np.ndarray | None,
+        limit: int = 10,
+        source_filter: str | None = None,
+        rrf_k: int = 60,
+    ) -> list[dict]:
+        """Hybrid search combining FTS5 BM25 and KNN vector results using RRF.
+
+        If query_embedding is None, falls back to FTS-only. If FTS returns
+        no results, falls back to vector-only.
+        """
+        fetch_limit = limit * 3
+
+        # FTS5 results
+        fts_results = self.search_fts(
+            query, limit=fetch_limit, source_filter=source_filter
+        )
+
+        # Vector results
+        vec_results: list[dict] = []
+        if query_embedding is not None:
+            vec_results = self.search(
+                query_embedding, limit=fetch_limit, source_filter=source_filter
+            )
+
+        # If only one system returned results, annotate and return
+        if not fts_results and not vec_results:
+            return []
+        if not fts_results:
+            for r in vec_results:
+                r["match_type"] = "semantic"
+            return vec_results[:limit]
+        if not vec_results:
+            for r in fts_results:
+                r["match_type"] = "keyword"
+            return fts_results[:limit]
+
+        # Reciprocal Rank Fusion
+        scores: dict[int, float] = {}
+        match_types: dict[int, set[str]] = {}
+        docs: dict[int, dict] = {}
+
+        for rank, doc in enumerate(fts_results, start=1):
+            doc_id = doc["id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+            match_types.setdefault(doc_id, set()).add("keyword")
+            docs[doc_id] = doc
+
+        for rank, doc in enumerate(vec_results, start=1):
+            doc_id = doc["id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+            match_types.setdefault(doc_id, set()).add("semantic")
+            if doc_id not in docs:
+                docs[doc_id] = doc
+
+        ranked_ids = sorted(scores, key=lambda did: scores[did], reverse=True)
+
+        results = []
+        for doc_id in ranked_ids[:limit]:
+            doc = dict(docs[doc_id])
+            doc["rrf_score"] = scores[doc_id]
+            doc["match_type"] = "+".join(sorted(match_types[doc_id]))
+            results.append(doc)
+
+        return results
 
     def get_cursor(self) -> int | None:
         """Get the stored Jetstream cursor (microseconds timestamp)."""

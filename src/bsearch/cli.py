@@ -83,17 +83,36 @@ def serve(ctx):
     default=None,
     help="Filter by source type.",
 )
-def search(query: str, limit: int, source: str | None):
-    """Semantic search across indexed posts."""
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["hybrid", "keyword", "semantic"]),
+    default="hybrid",
+    help="Search mode: hybrid (default), keyword (FTS only), or semantic (vector only).",
+)
+def search(query: str, limit: int, source: str | None, mode: str):
+    """Search across indexed posts."""
     config = Config.from_env()
     from bsearch.db import Database
-    from bsearch.embeddings import Embedder
 
     db = Database(config.db_path)
-    embedder = Embedder(config.embedding_model, quiet=True)
 
-    query_embedding = embedder.encode_single(query)
-    results = db.search(query_embedding, limit=limit, source_filter=source)
+    query_embedding = None
+    if mode in ("hybrid", "semantic"):
+        from bsearch.embeddings import Embedder
+
+        embedder = Embedder(config.embedding_model, quiet=True)
+        query_embedding = embedder.encode_single(query)
+
+    if mode == "keyword":
+        results = db.search_fts(query, limit=limit, source_filter=source)
+    elif mode == "semantic":
+        assert query_embedding is not None
+        results = db.search(query_embedding, limit=limit, source_filter=source)
+    else:
+        results = db.search_hybrid(
+            query, query_embedding, limit=limit, source_filter=source
+        )
 
     if not results:
         click.echo("No results found.")
@@ -102,7 +121,17 @@ def search(query: str, limit: int, source: str | None):
 
     for i, r in enumerate(results, 1):
         web_url = _at_uri_to_web_url(r["uri"])
-        click.echo(f"\n--- Result {i} (distance: {r['distance']:.4f}) ---")
+
+        if mode == "hybrid" and "rrf_score" in r:
+            score_info = f"score: {r['rrf_score']:.4f}, match: {r['match_type']}"
+        elif mode == "keyword" and "bm25_rank" in r:
+            score_info = f"bm25: {r['bm25_rank']:.4f}"
+        elif "distance" in r:
+            score_info = f"distance: {r['distance']:.4f}"
+        else:
+            score_info = ""
+
+        click.echo(f"\n--- Result {i} ({score_info}) ---")
         click.echo(f"Author:  {r['author_handle']}")
         click.echo(f"Date:    {r['created_at']}")
         click.echo(f"Source:  {r['source']}")
