@@ -377,6 +377,10 @@ class Database:
             "cursor": cursor,
         }
 
+    def vacuum(self) -> None:
+        """Reclaim unused space and defragment the database file."""
+        self.conn.execute("VACUUM")
+
     def close(self) -> None:
         """Close the database connection."""
         self.conn.close()

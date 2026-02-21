@@ -228,6 +228,30 @@ def status():
     db.close()
 
 
+@cli.command()
+def vacuum():
+    """Reclaim unused space and defragment the database."""
+    import os
+
+    config = Config.from_env()
+    from bsearch.db import Database
+
+    db_file = config.db_path
+    size_before = os.path.getsize(db_file)
+
+    db = Database(db_file)
+    db.vacuum()
+    db.close()
+
+    size_after = os.path.getsize(db_file)
+    saved = size_before - size_after
+
+    click.echo(f"Database:  {db_file}")
+    click.echo(f"Before:    {size_before:,} bytes")
+    click.echo(f"After:     {size_after:,} bytes")
+    click.echo(f"Reclaimed: {saved:,} bytes")
+
+
 @cli.command("install-service")
 def install_service():
     """Generate and load a launchd plist for background operation."""
