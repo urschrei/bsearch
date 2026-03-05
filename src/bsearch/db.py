@@ -165,19 +165,51 @@ class Database:
             )
         self.conn.commit()
 
+    def list_by_handle(
+        self,
+        handle: str,
+        limit: int = 10,
+        source_filter: str | None = None,
+    ) -> list[dict]:
+        """Return posts by a given author handle, newest first."""
+        params: list = [handle]
+        sql = """
+            SELECT
+                p.id,
+                p.uri,
+                p.cid,
+                p.author_did,
+                p.author_handle,
+                p.text,
+                p.created_at,
+                p.source,
+                p.indexed_at
+            FROM posts p
+            WHERE p.author_handle = ?
+        """
+        if source_filter:
+            sql += " AND p.source = ?"
+            params.append(source_filter)
+        sql += " ORDER BY p.created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
     def search(
         self,
         query_embedding: np.ndarray,
         limit: int = 10,
         source_filter: str | None = None,
+        handle_filter: str | None = None,
     ) -> list[dict]:
-        """KNN vector search, optionally filtered by source.
+        """KNN vector search, optionally filtered by source and/or handle.
 
-        When a source filter is specified, we over-fetch from the vector index
-        and then filter in Python, since sqlite-vec does not support WHERE
-        clauses on joined tables within the KNN query.
+        When a source or handle filter is specified, we over-fetch from the
+        vector index and then filter in Python, since sqlite-vec does not
+        support WHERE clauses on joined tables within the KNN query.
         """
-        fetch_limit = limit * 5 if source_filter else limit
+        needs_post_filter = source_filter or handle_filter
+        fetch_limit = limit * 5 if needs_post_filter else limit
         rows = self.conn.execute(
             """
             SELECT
@@ -203,6 +235,8 @@ class Database:
         results = [dict(row) for row in rows]
         if source_filter:
             results = [r for r in results if r["source"] == source_filter]
+        if handle_filter:
+            results = [r for r in results if r["author_handle"] == handle_filter]
         return results[:limit]
 
     def search_fts(
@@ -210,6 +244,7 @@ class Database:
         query: str,
         limit: int = 10,
         source_filter: str | None = None,
+        handle_filter: str | None = None,
     ) -> list[dict]:
         """Full-text search using FTS5 BM25 ranking.
 
@@ -218,57 +253,47 @@ class Database:
         """
         if not query or not query.strip():
             return []
+
+        where_parts = ["fts_posts MATCH ?"]
+        params: list = [query]
+        if source_filter:
+            where_parts.append("p.source = ?")
+            params.append(source_filter)
+        if handle_filter:
+            where_parts.append("p.author_handle = ?")
+            params.append(handle_filter)
+        params.append(limit)
+
+        where_clause = " AND ".join(where_parts)
+        sql = f"""
+            SELECT
+                p.id,
+                fts_posts.rank AS bm25_rank,
+                p.uri,
+                p.cid,
+                p.author_did,
+                p.author_handle,
+                p.text,
+                p.created_at,
+                p.source,
+                p.indexed_at
+            FROM fts_posts
+            INNER JOIN posts p ON p.id = fts_posts.rowid
+            WHERE {where_clause}
+            ORDER BY fts_posts.rank
+            LIMIT ?
+        """
+
         try:
-            if source_filter:
-                rows = self.conn.execute(
-                    """
-                    SELECT
-                        p.id,
-                        fts_posts.rank AS bm25_rank,
-                        p.uri,
-                        p.cid,
-                        p.author_did,
-                        p.author_handle,
-                        p.text,
-                        p.created_at,
-                        p.source,
-                        p.indexed_at
-                    FROM fts_posts
-                    INNER JOIN posts p ON p.id = fts_posts.rowid
-                    WHERE fts_posts MATCH ?
-                        AND p.source = ?
-                    ORDER BY fts_posts.rank
-                    LIMIT ?
-                    """,
-                    (query, source_filter, limit),
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    """
-                    SELECT
-                        p.id,
-                        fts_posts.rank AS bm25_rank,
-                        p.uri,
-                        p.cid,
-                        p.author_did,
-                        p.author_handle,
-                        p.text,
-                        p.created_at,
-                        p.source,
-                        p.indexed_at
-                    FROM fts_posts
-                    INNER JOIN posts p ON p.id = fts_posts.rowid
-                    WHERE fts_posts MATCH ?
-                    ORDER BY fts_posts.rank
-                    LIMIT ?
-                    """,
-                    (query, limit),
-                ).fetchall()
+            rows = self.conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
             logger.debug("FTS query failed for %r, retrying as phrase", query)
             try:
                 return self.search_fts(
-                    f'"{query}"', limit=limit, source_filter=source_filter
+                    f'"{query}"',
+                    limit=limit,
+                    source_filter=source_filter,
+                    handle_filter=handle_filter,
                 )
             except sqlite3.OperationalError:
                 logger.debug("FTS phrase query also failed for %r", query)
@@ -281,6 +306,7 @@ class Database:
         query_embedding: np.ndarray | None,
         limit: int = 10,
         source_filter: str | None = None,
+        handle_filter: str | None = None,
         rrf_k: int = 60,
     ) -> list[dict]:
         """Hybrid search combining FTS5 BM25 and KNN vector results using RRF.
@@ -292,14 +318,20 @@ class Database:
 
         # FTS5 results
         fts_results = self.search_fts(
-            query, limit=fetch_limit, source_filter=source_filter
+            query,
+            limit=fetch_limit,
+            source_filter=source_filter,
+            handle_filter=handle_filter,
         )
 
         # Vector results
         vec_results: list[dict] = []
         if query_embedding is not None:
             vec_results = self.search(
-                query_embedding, limit=fetch_limit, source_filter=source_filter
+                query_embedding,
+                limit=fetch_limit,
+                source_filter=source_filter,
+                handle_filter=handle_filter,
             )
 
         # If only one system returned results, annotate and return
