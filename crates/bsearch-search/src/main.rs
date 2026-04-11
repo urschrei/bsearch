@@ -4,8 +4,10 @@ mod embed;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use anyhow::Context;
+use anyhow::Result;
+use clap::Parser;
+use clap::ValueEnum;
 use colored::Colorize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -16,7 +18,7 @@ enum SearchMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SourceType {
+enum SourceType {
     OwnPost,
     Like,
     BackfillPost,
@@ -24,7 +26,7 @@ pub enum SourceType {
 }
 
 impl SourceType {
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::OwnPost => "own_post",
             Self::Like => "like",
@@ -136,19 +138,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn at_uri_to_web_url(uri: &str) -> String {
-    if let Some(rest) = uri.strip_prefix("at://") {
-        let mut parts = rest.splitn(3, '/');
-        let did = parts.next();
-        let collection = parts.next();
-        let rkey = parts.next();
-        if let (Some(did), Some("app.bsky.feed.post"), Some(rkey)) = (did, collection, rkey) {
-            return format!("https://bsky.app/profile/{did}/post/{rkey}");
-        }
-    }
-    uri.to_string()
-}
-
 fn print_result(index: usize, r: &db::SearchResult) {
     let web_url = at_uri_to_web_url(&r.uri);
 
@@ -171,6 +160,19 @@ fn print_result(index: usize, r: &db::SearchResult) {
     println!("{}  {}", "Source:".dimmed(), r.source.magenta());
     println!("{}  {}", "Link:".dimmed(), web_url.blue().underline());
     println!("{}  {}", "Text:".dimmed(), r.text);
+}
+
+fn at_uri_to_web_url(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("at://") {
+        let mut parts = rest.splitn(3, '/');
+        let did = parts.next();
+        let collection = parts.next();
+        let rkey = parts.next();
+        if let (Some(did), Some("app.bsky.feed.post"), Some(rkey)) = (did, collection, rkey) {
+            return format!("https://bsky.app/profile/{did}/post/{rkey}");
+        }
+    }
+    uri.to_string()
 }
 
 #[cfg(test)]

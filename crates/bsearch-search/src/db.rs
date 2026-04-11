@@ -3,8 +3,10 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Once;
 
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use anyhow::Context;
+use anyhow::Result;
+use rusqlite::Connection;
+use rusqlite::OpenFlags;
 
 /// Describes which retrieval method(s) contributed to a search result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,28 +48,6 @@ pub struct SearchResult {
 
 pub struct Database {
     conn: Connection,
-}
-
-/// Register the sqlite-vec extension as an auto-extension so that every
-/// new `Connection` automatically has vector search available.  The
-/// registration is performed only once per process.
-fn register_sqlite_vec() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| unsafe {
-        type AutoExtFn = unsafe extern "C" fn(
-            *mut rusqlite::ffi::sqlite3,
-            *mut *mut ::std::os::raw::c_char,
-            *const rusqlite::ffi::sqlite3_api_routines,
-        ) -> ::std::os::raw::c_int;
-        // SAFETY: `sqlite3_vec_init` has the same ABI as `AutoExtFn` (the
-        // sqlite3 auto-extension entry point signature). The transmute
-        // through `*const ()` is required because Rust's type system cannot
-        // express the C function pointer equivalence directly. This is the
-        // pattern recommended by the sqlite-vec crate documentation.
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtFn>(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    });
 }
 
 impl Database {
@@ -377,6 +357,28 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+}
+
+/// Register the sqlite-vec extension as an auto-extension so that every
+/// new `Connection` automatically has vector search available.  The
+/// registration is performed only once per process.
+fn register_sqlite_vec() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        type AutoExtFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut ::std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> ::std::os::raw::c_int;
+        // SAFETY: `sqlite3_vec_init` has the same ABI as `AutoExtFn` (the
+        // sqlite3 auto-extension entry point signature). The transmute
+        // through `*const ()` is required because Rust's type system cannot
+        // express the C function pointer equivalence directly. This is the
+        // pattern recommended by the sqlite-vec crate documentation.
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtFn>(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
 }
 
 #[cfg(test)]
