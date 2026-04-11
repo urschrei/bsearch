@@ -108,21 +108,15 @@ impl Embedder {
 /// `hidden_state` has shape (seq_len, hidden_dim).
 /// `attention_mask` has shape (seq_len,) with 1.0 for real tokens and 0.0 for padding.
 pub fn mean_pool(hidden_state: &Array2<f32>, attention_mask: &Array1<f32>) -> Array1<f32> {
-    let hidden_dim = hidden_state.ncols();
-    let mut sum = Array1::<f32>::zeros(hidden_dim);
-    let mut mask_sum: f32 = 0.0;
-
-    for (i, mask_val) in attention_mask.iter().enumerate() {
-        if *mask_val > 0.0 {
-            sum += &(hidden_state.row(i).to_owned() * *mask_val);
-            mask_sum += mask_val;
-        }
-    }
-
-    if mask_sum > 0.0 {
-        sum /= mask_sum;
-    }
-    sum
+    let seq_len = hidden_state.nrows();
+    let mask_col = attention_mask
+        .view()
+        .into_shape_with_order((seq_len, 1))
+        .expect("mask reshape failed");
+    let masked = hidden_state * &mask_col;
+    let sum = masked.sum_axis(ndarray::Axis(0));
+    let mask_sum = attention_mask.sum();
+    if mask_sum > 0.0 { sum / mask_sum } else { sum }
 }
 
 /// L2-normalise a vector, returning a unit vector.

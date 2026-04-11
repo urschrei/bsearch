@@ -35,11 +35,15 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_defaults_when_no_env() {
-        std::env::remove_var("BSEARCH_DB_PATH");
-        std::env::remove_var("BSEARCH_MODEL_DIR");
+        unsafe {
+            std::env::remove_var("BSEARCH_DB_PATH");
+            std::env::remove_var("BSEARCH_MODEL_DIR");
+        }
 
         let config = Config::resolve(None, None).unwrap();
         assert_eq!(config.db_path, PathBuf::from("bsearch.db"));
@@ -47,18 +51,28 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cli_overrides_env() {
-        std::env::set_var("BSEARCH_DB_PATH", "/env/path.db");
+        unsafe {
+            std::env::set_var("BSEARCH_DB_PATH", "/env/path.db");
+        }
         let config = Config::resolve(Some(PathBuf::from("/cli/path.db")), None).unwrap();
         assert_eq!(config.db_path, PathBuf::from("/cli/path.db"));
-        std::env::remove_var("BSEARCH_DB_PATH");
+        unsafe {
+            std::env::remove_var("BSEARCH_DB_PATH");
+        }
     }
 
     #[test]
+    #[serial]
     fn test_env_var_used_when_no_cli() {
-        std::env::set_var("BSEARCH_DB_PATH", "/env/path.db");
+        unsafe {
+            std::env::set_var("BSEARCH_DB_PATH", "/env/path.db");
+        }
         let config = Config::resolve(None, None).unwrap();
         assert_eq!(config.db_path, PathBuf::from("/env/path.db"));
-        std::env::remove_var("BSEARCH_DB_PATH");
+        unsafe {
+            std::env::remove_var("BSEARCH_DB_PATH");
+        }
     }
 }

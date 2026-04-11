@@ -1,26 +1,47 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::Once;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
+/// Describes which retrieval method(s) contributed to a search result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchType {
+    Keyword,
+    Semantic,
+    KeywordAndSemantic,
+}
+
+impl fmt::Display for MatchType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Keyword => write!(f, "keyword"),
+            Self::Semantic => write!(f, "semantic"),
+            Self::KeywordAndSemantic => write!(f, "keyword+semantic"),
+        }
+    }
+}
+
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct SearchResult {
     pub id: i64,
     pub uri: String,
+    #[allow(dead_code)] // fetched from DB for completeness, not currently displayed
     pub cid: String,
+    #[allow(dead_code)] // fetched from DB for completeness, not currently displayed
     pub author_did: String,
     pub author_handle: String,
     pub text: String,
     pub created_at: String,
     pub source: String,
+    #[allow(dead_code)] // fetched from DB for completeness, not currently displayed
     pub indexed_at: String,
     pub distance: Option<f64>,
     pub bm25_rank: Option<f64>,
     pub rrf_score: Option<f64>,
-    pub match_type: Option<String>,
+    pub match_type: Option<MatchType>,
 }
 
 pub struct Database {
@@ -38,6 +59,11 @@ fn register_sqlite_vec() {
             *mut *mut ::std::os::raw::c_char,
             *const rusqlite::ffi::sqlite3_api_routines,
         ) -> ::std::os::raw::c_int;
+        // SAFETY: `sqlite3_vec_init` has the same ABI as `AutoExtFn` (the
+        // sqlite3 auto-extension entry point signature). The transmute
+        // through `*const ()` is required because Rust's type system cannot
+        // express the C function pointer equivalence directly. This is the
+        // pattern recommended by the sqlite-vec crate documentation.
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtFn>(
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
@@ -68,12 +94,18 @@ impl Database {
 
         match self.run_fts_query(query, limit, source_filter, handle_filter) {
             Ok(results) => Ok(results),
-            Err(_) => {
-                // Retry as phrase query by wrapping in double quotes
+            Err(e) => {
+                // FTS5 syntax errors manifest as generic sqlite errors;
+                // retry the query wrapped as a phrase literal.
                 let phrase = format!("\"{}\"", query.replace('"', ""));
                 match self.run_fts_query(&phrase, limit, source_filter, handle_filter) {
                     Ok(results) => Ok(results),
-                    Err(_) => Ok(vec![]),
+                    Err(retry_err) => {
+                        // If both attempts fail, propagate the original error
+                        // as it is more likely to be informative.
+                        Err(retry_err)
+                            .with_context(|| format!("FTS query failed (original error: {e})"))
+                    }
                 }
             }
         }
@@ -139,15 +171,13 @@ impl Database {
                 indexed_at: row.get(9)?,
                 distance: None,
                 rrf_score: None,
-                match_type: Some("fts".to_string()),
+                match_type: Some(MatchType::Keyword),
             })
         })?;
 
-        let mut out = Vec::new();
-        for r in results {
-            out.push(r?);
-        }
-        Ok(out)
+        results
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn search_vec(
@@ -193,7 +223,7 @@ impl Database {
                     indexed_at: row.get(9)?,
                     bm25_rank: None,
                     rrf_score: None,
-                    match_type: Some("semantic".to_string()),
+                    match_type: Some(MatchType::Semantic),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -230,7 +260,7 @@ impl Database {
         if fts_results.is_empty() && !vec_results.is_empty() {
             let mut out = vec_results;
             for r in &mut out {
-                r.match_type = Some("semantic".to_string());
+                r.match_type = Some(MatchType::Semantic);
             }
             out.truncate(limit);
             return Ok(out);
@@ -238,7 +268,7 @@ impl Database {
         if !fts_results.is_empty() && vec_results.is_empty() {
             let mut out = fts_results;
             for r in &mut out {
-                r.match_type = Some("keyword".to_string());
+                r.match_type = Some(MatchType::Keyword);
             }
             out.truncate(limit);
             return Ok(out);
@@ -251,29 +281,23 @@ impl Database {
         // k=60 is the standard RRF constant
         const K: f64 = 60.0;
 
-        // Map from doc id to (RRF score, match types, SearchResult index in merged vec)
         let mut rrf_scores: BTreeMap<i64, f64> = BTreeMap::new();
-        let mut match_types: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        let mut has_keyword: BTreeMap<i64, bool> = BTreeMap::new();
+        let mut has_semantic: BTreeMap<i64, bool> = BTreeMap::new();
         // Keep one representative SearchResult per doc id
         let mut result_map: BTreeMap<i64, SearchResult> = BTreeMap::new();
 
         for (rank, r) in fts_results.into_iter().enumerate() {
             let score = 1.0 / (K + (rank + 1) as f64);
             *rrf_scores.entry(r.id).or_insert(0.0) += score;
-            match_types
-                .entry(r.id)
-                .or_default()
-                .insert("keyword".to_string());
+            has_keyword.insert(r.id, true);
             result_map.entry(r.id).or_insert(r);
         }
 
         for (rank, r) in vec_results.into_iter().enumerate() {
             let score = 1.0 / (K + (rank + 1) as f64);
             *rrf_scores.entry(r.id).or_insert(0.0) += score;
-            match_types
-                .entry(r.id)
-                .or_default()
-                .insert("semantic".to_string());
+            has_semantic.insert(r.id, true);
             result_map.entry(r.id).or_insert(r);
         }
 
@@ -286,10 +310,14 @@ impl Database {
         for (id, score) in scored {
             if let Some(mut r) = result_map.remove(&id) {
                 r.rrf_score = Some(score);
-                let types = match_types.remove(&id).unwrap_or_default();
-                // BTreeSet sorts alphabetically: "keyword" < "semantic"
-                // so joined gives "keyword", "semantic", or "keyword+semantic"
-                r.match_type = Some(types.into_iter().collect::<Vec<_>>().join("+"));
+                let kw = has_keyword.contains_key(&id);
+                let sem = has_semantic.contains_key(&id);
+                r.match_type = Some(match (kw, sem) {
+                    (true, true) => MatchType::KeywordAndSemantic,
+                    (true, false) => MatchType::Keyword,
+                    (false, true) => MatchType::Semantic,
+                    (false, false) => unreachable!(),
+                });
                 out.push(r);
             }
         }
@@ -310,7 +338,6 @@ impl Database {
              WHERE p.author_handle = ?1 AND p.source = ?2
              ORDER BY p.created_at DESC
              LIMIT ?3"
-                .to_string()
         } else {
             "SELECT p.id, p.uri, p.cid, p.author_did, p.author_handle, p.text,
                     p.created_at, p.source, p.indexed_at
@@ -318,10 +345,9 @@ impl Database {
              WHERE p.author_handle = ?1
              ORDER BY p.created_at DESC
              LIMIT ?2"
-                .to_string()
         };
 
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare(sql)?;
 
         let map_row = |row: &rusqlite::Row<'_>| {
             Ok(SearchResult {
@@ -347,11 +373,9 @@ impl Database {
             stmt.query_map(rusqlite::params![handle, limit as i64], map_row)?
         };
 
-        let mut out = Vec::new();
-        for r in results {
-            out.push(r?);
-        }
-        Ok(out)
+        results
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 
@@ -590,8 +614,8 @@ mod tests {
         // Post 1 should be first: it matches both keyword and vector
         assert_eq!(results[0].uri, "uri:1");
         assert_eq!(
-            results[0].match_type.as_deref(),
-            Some("keyword+semantic"),
+            results[0].match_type,
+            Some(MatchType::KeywordAndSemantic),
             "post 1 should match both sources"
         );
     }
@@ -615,7 +639,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].uri, "uri:1");
-        assert_eq!(results[0].match_type.as_deref(), Some("keyword"));
+        assert_eq!(results[0].match_type, Some(MatchType::Keyword));
     }
 
     #[test]

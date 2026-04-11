@@ -5,8 +5,34 @@ mod embed;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use colored::Colorize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SearchMode {
+    Hybrid,
+    Keyword,
+    Semantic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SourceType {
+    OwnPost,
+    Like,
+    BackfillPost,
+    BackfillLike,
+}
+
+impl SourceType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OwnPost => "own_post",
+            Self::Like => "like",
+            Self::BackfillPost => "backfill_post",
+            Self::BackfillLike => "backfill_like",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -23,12 +49,12 @@ struct Cli {
     limit: usize,
 
     /// Filter by source type
-    #[arg(short, long, value_parser = ["own_post", "like", "backfill_post", "backfill_like"])]
-    source: Option<String>,
+    #[arg(short, long)]
+    source: Option<SourceType>,
 
     /// Search mode
-    #[arg(short, long, default_value = "hybrid", value_parser = ["hybrid", "keyword", "semantic"])]
-    mode: String,
+    #[arg(short, long, default_value = "hybrid")]
+    mode: SearchMode,
 
     /// Filter by author handle
     #[arg(short = 'a', long)]
@@ -51,13 +77,14 @@ fn main() -> Result<()> {
         anyhow::bail!("Provide a query and/or --handle to search.");
     }
 
+    let source_str = cli.source.map(|s| s.as_str());
     let database = db::Database::open(&config.db_path)
         .with_context(|| format!("Failed to open database at {}", config.db_path.display()))?;
 
     // No query: list posts by handle
     if cli.query.is_none() {
         let handle = cli.handle.as_deref().unwrap();
-        let results = database.list_by_handle(handle, cli.limit, cli.source.as_deref())?;
+        let results = database.list_by_handle(handle, cli.limit, source_str)?;
         if results.is_empty() {
             eprintln!("No results found.");
             return Ok(());
@@ -71,30 +98,28 @@ fn main() -> Result<()> {
     let query = cli.query.as_deref().unwrap();
 
     // Load embedder only for hybrid/semantic modes
-    let query_embedding = if cli.mode == "keyword" {
-        None
-    } else {
-        let mut embedder =
-            embed::Embedder::load(&config.model_dir).context("Failed to load embedding model")?;
-        Some(embedder.encode(query).context("Failed to encode query")?)
+    let query_embedding = match cli.mode {
+        SearchMode::Keyword => None,
+        SearchMode::Hybrid | SearchMode::Semantic => {
+            let mut embedder = embed::Embedder::load(&config.model_dir)
+                .context("Failed to load embedding model")?;
+            Some(embedder.encode(query).context("Failed to encode query")?)
+        }
     };
 
-    let results = match cli.mode.as_str() {
-        "keyword" => database.search_fts(
-            query,
-            cli.limit,
-            cli.source.as_deref(),
-            cli.handle.as_deref(),
-        )?,
-        "semantic" => {
-            let emb = query_embedding.as_ref().unwrap();
-            database.search_vec(emb, cli.limit, cli.source.as_deref(), cli.handle.as_deref())?
+    let results = match cli.mode {
+        SearchMode::Keyword => {
+            database.search_fts(query, cli.limit, source_str, cli.handle.as_deref())?
         }
-        _ => database.search_hybrid(
+        SearchMode::Semantic => {
+            let emb = query_embedding.as_ref().unwrap();
+            database.search_vec(emb, cli.limit, source_str, cli.handle.as_deref())?
+        }
+        SearchMode::Hybrid => database.search_hybrid(
             query,
             query_embedding.as_ref(),
             cli.limit,
-            cli.source.as_deref(),
+            source_str,
             cli.handle.as_deref(),
         )?,
     };
@@ -113,9 +138,12 @@ fn main() -> Result<()> {
 
 fn at_uri_to_web_url(uri: &str) -> String {
     if let Some(rest) = uri.strip_prefix("at://") {
-        let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() >= 3 && parts[1] == "app.bsky.feed.post" {
-            return format!("https://bsky.app/profile/{}/post/{}", parts[0], parts[2]);
+        let mut parts = rest.splitn(3, '/');
+        let did = parts.next();
+        let collection = parts.next();
+        let rkey = parts.next();
+        if let (Some(did), Some("app.bsky.feed.post"), Some(rkey)) = (did, collection, rkey) {
+            return format!("https://bsky.app/profile/{did}/post/{rkey}");
         }
     }
     uri.to_string()
@@ -124,15 +152,11 @@ fn at_uri_to_web_url(uri: &str) -> String {
 fn print_result(index: usize, r: &db::SearchResult) {
     let web_url = at_uri_to_web_url(&r.uri);
 
-    let score_info = if let Some(rrf) = r.rrf_score {
-        let mt = r.match_type.as_deref().unwrap_or("");
-        format!("score: {rrf:.4}, match: {mt}")
-    } else if let Some(bm25) = r.bm25_rank {
-        format!("bm25: {bm25:.4}")
-    } else if let Some(dist) = r.distance {
-        format!("distance: {dist:.4}")
-    } else {
-        String::new()
+    let score_info = match (r.rrf_score, r.bm25_rank, r.distance, r.match_type) {
+        (Some(rrf), _, _, Some(mt)) => format!("score: {rrf:.4}, match: {mt}"),
+        (_, Some(bm25), _, _) => format!("bm25: {bm25:.4}"),
+        (_, _, Some(dist), _) => format!("distance: {dist:.4}"),
+        _ => String::new(),
     };
 
     println!(
