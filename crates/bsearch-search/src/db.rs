@@ -226,6 +226,7 @@ impl Database {
         limit: usize,
         source_filter: Option<&str>,
         handle_filter: Option<&str>,
+        max_semantic_distance: f64,
     ) -> Result<Vec<SearchResult>> {
         let fetch_limit = limit * 3;
 
@@ -260,10 +261,6 @@ impl Database {
         // Both have results: compute RRF scores
         // k=60 is the standard RRF constant
         const K: f64 = 60.0;
-        // Maximum L2 distance for semantic-only results to be included.
-        // Embeddings are L2-normalised, so distances range from 0 (identical)
-        // to 2 (opposite). 1.05 admits only close semantic matches.
-        const MAX_SEMANTIC_DISTANCE: f64 = 1.05;
 
         let mut rrf_scores: BTreeMap<i64, f64> = BTreeMap::new();
         let mut has_keyword: BTreeMap<i64, bool> = BTreeMap::new();
@@ -304,7 +301,7 @@ impl Database {
                 }
                 if sem {
                     if let Some(&d) = vec_distance.get(id) {
-                        return d <= MAX_SEMANTIC_DISTANCE;
+                        return d <= max_semantic_distance;
                     }
                 }
                 false
@@ -643,7 +640,7 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_hybrid("rustacean", Some(&query_emb), 10, None, None)
+            .search_hybrid("rustacean", Some(&query_emb), 10, None, None, 1.05)
             .expect("hybrid search failed");
 
         assert!(!results.is_empty(), "should have results");
@@ -670,7 +667,7 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_hybrid("hello", None, 10, None, None)
+            .search_hybrid("hello", None, 10, None, None, 1.05)
             .expect("hybrid search failed");
 
         assert_eq!(results.len(), 1);
@@ -685,7 +682,7 @@ mod tests {
         let db = Database::open(&path).expect("open failed");
         let query_emb = [0.0f32; 384];
         let results = db
-            .search_hybrid("anything", Some(&query_emb), 10, None, None)
+            .search_hybrid("anything", Some(&query_emb), 10, None, None, 1.05)
             .expect("hybrid search on empty db failed");
 
         assert!(results.is_empty());

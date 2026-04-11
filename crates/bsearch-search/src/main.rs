@@ -69,6 +69,12 @@ struct Cli {
     /// Model directory (containing model.onnx and tokenizer.json)
     #[arg(long, env = "BSEARCH_MODEL_DIR")]
     model: Option<PathBuf>,
+
+    /// Maximum L2 distance for semantic-only results in hybrid mode.
+    /// Embeddings are L2-normalised, so distances range from 0 (identical)
+    /// to 2 (opposite). Only affects results that lack a keyword match.
+    #[arg(long, default_value_t = 1.05)]
+    max_semantic_distance: f64,
 }
 
 fn main() -> Result<()> {
@@ -123,6 +129,7 @@ fn main() -> Result<()> {
             cli.limit,
             source_str,
             cli.handle.as_deref(),
+            cli.max_semantic_distance,
         )?,
     };
 
