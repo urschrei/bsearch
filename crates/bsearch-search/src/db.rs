@@ -1,4 +1,6 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Once;
 
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
@@ -24,8 +26,26 @@ pub struct Database {
     conn: Connection,
 }
 
+/// Register the sqlite-vec extension as an auto-extension so that every
+/// new `Connection` automatically has vector search available.  The
+/// registration is performed only once per process.
+fn register_sqlite_vec() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        type AutoExtFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut ::std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> ::std::os::raw::c_int;
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtFn>(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
+        register_sqlite_vec();
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -129,6 +149,153 @@ impl Database {
         Ok(out)
     }
 
+    pub fn search_vec(
+        &self,
+        query_embedding: &[f32; 384],
+        limit: usize,
+        source_filter: Option<&str>,
+        handle_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        // Over-fetch when filters are active so we have enough results after filtering
+        let fetch_limit = if source_filter.is_some() || handle_filter.is_some() {
+            limit * 5
+        } else {
+            limit
+        };
+
+        let bytes: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let sql = "SELECT v.rowid AS id, v.distance, p.uri, p.cid, p.author_did, p.author_handle,
+                          p.text, p.created_at, p.source, p.indexed_at
+                   FROM vec_posts v
+                   INNER JOIN posts p ON p.id = v.rowid
+                   WHERE v.embedding MATCH ?1 AND k = ?2
+                   ORDER BY v.distance";
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let mut results: Vec<SearchResult> = stmt
+            .query_map(rusqlite::params![bytes, fetch_limit as i64], |row| {
+                Ok(SearchResult {
+                    id: row.get(0)?,
+                    distance: row.get(1)?,
+                    uri: row.get(2)?,
+                    cid: row.get(3)?,
+                    author_did: row.get(4)?,
+                    author_handle: row.get(5)?,
+                    text: row.get(6)?,
+                    created_at: row.get(7)?,
+                    source: row.get(8)?,
+                    indexed_at: row.get(9)?,
+                    bm25_rank: None,
+                    rrf_score: None,
+                    match_type: Some("semantic".to_string()),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if let Some(s) = source_filter {
+            results.retain(|r| r.source == s);
+        }
+        if let Some(h) = handle_filter {
+            results.retain(|r| r.author_handle == h);
+        }
+        results.truncate(limit);
+
+        Ok(results)
+    }
+
+    pub fn search_hybrid(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32; 384]>,
+        limit: usize,
+        source_filter: Option<&str>,
+        handle_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let fetch_limit = limit * 3;
+
+        let fts_results = self.search_fts(query, fetch_limit, source_filter, handle_filter)?;
+        let vec_results = if let Some(emb) = query_embedding {
+            self.search_vec(emb, fetch_limit, source_filter, handle_filter)?
+        } else {
+            vec![]
+        };
+
+        // Fallback: only one source has results
+        if fts_results.is_empty() && !vec_results.is_empty() {
+            let mut out = vec_results;
+            for r in &mut out {
+                r.match_type = Some("semantic".to_string());
+            }
+            out.truncate(limit);
+            return Ok(out);
+        }
+        if !fts_results.is_empty() && vec_results.is_empty() {
+            let mut out = fts_results;
+            for r in &mut out {
+                r.match_type = Some("keyword".to_string());
+            }
+            out.truncate(limit);
+            return Ok(out);
+        }
+        if fts_results.is_empty() && vec_results.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Both have results: compute RRF scores
+        // k=60 is the standard RRF constant
+        const K: f64 = 60.0;
+
+        // Map from doc id to (RRF score, match types, SearchResult index in merged vec)
+        let mut rrf_scores: BTreeMap<i64, f64> = BTreeMap::new();
+        let mut match_types: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        // Keep one representative SearchResult per doc id
+        let mut result_map: BTreeMap<i64, SearchResult> = BTreeMap::new();
+
+        for (rank, r) in fts_results.into_iter().enumerate() {
+            let score = 1.0 / (K + (rank + 1) as f64);
+            *rrf_scores.entry(r.id).or_insert(0.0) += score;
+            match_types
+                .entry(r.id)
+                .or_default()
+                .insert("keyword".to_string());
+            result_map.entry(r.id).or_insert(r);
+        }
+
+        for (rank, r) in vec_results.into_iter().enumerate() {
+            let score = 1.0 / (K + (rank + 1) as f64);
+            *rrf_scores.entry(r.id).or_insert(0.0) += score;
+            match_types
+                .entry(r.id)
+                .or_default()
+                .insert("semantic".to_string());
+            result_map.entry(r.id).or_insert(r);
+        }
+
+        // Sort by RRF score descending
+        let mut scored: Vec<(i64, f64)> = rrf_scores.into_iter().collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        let mut out = Vec::with_capacity(scored.len());
+        for (id, score) in scored {
+            if let Some(mut r) = result_map.remove(&id) {
+                r.rrf_score = Some(score);
+                let types = match_types.remove(&id).unwrap_or_default();
+                // BTreeSet sorts alphabetically: "keyword" < "semantic"
+                // so joined gives "keyword", "semantic", or "keyword+semantic"
+                r.match_type = Some(types.into_iter().collect::<Vec<_>>().join("+"));
+                out.push(r);
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn list_by_handle(
         &self,
         handle: &str,
@@ -191,13 +358,14 @@ impl Database {
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::NamedTempFile;
 
     fn create_test_db() -> (NamedTempFile, PathBuf) {
         let file = NamedTempFile::new().expect("failed to create temp file");
         let path = file.path().to_path_buf();
 
+        register_sqlite_vec();
         let conn = Connection::open(&path).expect("failed to open db");
         conn.execute_batch(
             "CREATE TABLE posts (
@@ -226,6 +394,12 @@ mod tests {
         )
         .expect("failed to create schema");
 
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_posts USING vec0(embedding float[384])",
+            [],
+        )
+        .expect("failed to create vec_posts table");
+
         (file, path)
     }
 
@@ -237,6 +411,17 @@ mod tests {
             rusqlite::params![uri, handle, text, source],
         )
         .expect("failed to insert post");
+    }
+
+    fn insert_embedding(path: &Path, rowid: i64, embedding: &[f32; 384]) {
+        register_sqlite_vec();
+        let conn = Connection::open(path).expect("failed to open db");
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT INTO vec_posts (rowid, embedding) VALUES (?1, ?2)",
+            rusqlite::params![rowid, bytes],
+        )
+        .expect("failed to insert embedding");
     }
 
     #[test]
@@ -360,5 +545,88 @@ mod tests {
             .list_by_handle("bob.bsky.social", 10, None)
             .expect("list failed");
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_hybrid_both_sources() {
+        let (_file, path) = create_test_db();
+        // Post 1: matches by keyword "rustacean" AND will be the closest vector
+        insert_post(
+            &path,
+            "uri:1",
+            "rustacean programming language",
+            "bluesky",
+            "alice.bsky.social",
+        );
+        // Post 2: distinct content, different embedding
+        insert_post(
+            &path,
+            "uri:2",
+            "cooking recipes and food",
+            "bluesky",
+            "bob.bsky.social",
+        );
+
+        // Insert embeddings: post 1 gets rowid 1, post 2 gets rowid 2
+        // Make post 1's embedding close to the query and post 2's distant
+        let mut emb1 = [0.0f32; 384];
+        emb1[0] = 1.0;
+        let mut emb2 = [0.0f32; 384];
+        emb2[0] = -1.0;
+        insert_embedding(&path, 1, &emb1);
+        insert_embedding(&path, 2, &emb2);
+
+        // Query embedding close to emb1
+        let mut query_emb = [0.0f32; 384];
+        query_emb[0] = 0.9;
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_hybrid("rustacean", Some(&query_emb), 10, None, None)
+            .expect("hybrid search failed");
+
+        assert!(!results.is_empty(), "should have results");
+        // Post 1 should be first: it matches both keyword and vector
+        assert_eq!(results[0].uri, "uri:1");
+        assert_eq!(
+            results[0].match_type.as_deref(),
+            Some("keyword+semantic"),
+            "post 1 should match both sources"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_fts_only_fallback() {
+        let (_file, path) = create_test_db();
+        insert_post(
+            &path,
+            "uri:1",
+            "hello world unique text",
+            "bluesky",
+            "alice.bsky.social",
+        );
+        // No embeddings inserted
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_hybrid("hello", None, 10, None, None)
+            .expect("hybrid search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].uri, "uri:1");
+        assert_eq!(results[0].match_type.as_deref(), Some("keyword"));
+    }
+
+    #[test]
+    fn test_hybrid_empty_db() {
+        let (_file, path) = create_test_db();
+
+        let db = Database::open(&path).expect("open failed");
+        let query_emb = [0.0f32; 384];
+        let results = db
+            .search_hybrid("anything", Some(&query_emb), 10, None, None)
+            .expect("hybrid search on empty db failed");
+
+        assert!(results.is_empty());
     }
 }
