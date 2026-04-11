@@ -1,4 +1,105 @@
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use ndarray::{Array1, Array2};
+use ort::session::Session;
+use ort::value::Tensor;
+
+/// Loads an ONNX model and tokenizer, then uses them to encode text into
+/// 384-dimensional embeddings.
+pub struct Embedder {
+    session: Session,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+impl Embedder {
+    /// Load the ONNX model and tokenizer from a directory.
+    /// Expects `model.onnx` and `tokenizer.json` in `model_dir`.
+    pub fn load(model_dir: &Path) -> Result<Self> {
+        let model_path = model_dir.join("model.onnx");
+        let tokenizer_path = model_dir.join("tokenizer.json");
+
+        anyhow::ensure!(
+            model_path.exists(),
+            "ONNX model not found at {}. Run `bsearch export-model` first.",
+            model_path.display()
+        );
+        anyhow::ensure!(
+            tokenizer_path.exists(),
+            "Tokenizer not found at {}. Run `bsearch export-model` first.",
+            tokenizer_path.display()
+        );
+
+        let session = Session::builder()
+            .context("Failed to create ONNX Runtime session builder")?
+            .commit_from_file(&model_path)
+            .with_context(|| format!("Failed to load ONNX model from {}", model_path.display()))?;
+
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+
+        Ok(Embedder { session, tokenizer })
+    }
+
+    /// Encode a single text into a 384-dimensional embedding vector.
+    pub fn encode(&mut self, text: &str) -> Result<[f32; 384]> {
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("Tokenisation failed: {e}"))?;
+
+        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let attention_mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as i64)
+            .collect();
+        let token_type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
+        let seq_len = input_ids.len();
+
+        let ids_tensor =
+            Tensor::from_array((vec![1, seq_len as i64], input_ids)).context("input_ids tensor")?;
+        let mask_tensor = Tensor::from_array((vec![1, seq_len as i64], attention_mask))
+            .context("attention_mask tensor")?;
+        let type_tensor = Tensor::from_array((vec![1, seq_len as i64], token_type_ids))
+            .context("token_type_ids tensor")?;
+
+        let outputs = self.session.run(ort::inputs! {
+            "input_ids" => ids_tensor,
+            "attention_mask" => mask_tensor,
+            "token_type_ids" => type_tensor,
+        })?;
+
+        // Output: last_hidden_state with shape (1, seq_len, 384)
+        let output_tensor = outputs[0]
+            .try_extract_array::<f32>()
+            .context("Failed to extract output tensor")?;
+
+        // Reshape from (1, seq_len, 384) to (seq_len, 384)
+        let hidden_state = output_tensor
+            .into_shape_with_order((seq_len, 384))
+            .context("Failed to reshape hidden state")?;
+        let hidden_state: Array2<f32> = hidden_state.to_owned();
+
+        // Build attention mask as f32 for mean pooling
+        let mask_f32: Array1<f32> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as f32)
+            .collect();
+
+        let pooled = mean_pool(&hidden_state, &mask_f32);
+        let normalised = l2_normalise(&pooled);
+
+        let mut result = [0.0f32; 384];
+        result.copy_from_slice(
+            normalised
+                .as_slice()
+                .context("Embedding is not contiguous")?,
+        );
+        Ok(result)
+    }
+}
 
 /// Mean-pool token embeddings, masking padding tokens.
 ///
