@@ -9,7 +9,7 @@ instead of PyTorch for embedding inference.
 1. Export the model from the Python side (one-time):
 
    ```
-   bsearch export-model
+   uv run bsearch export-model
    ```
 
    This saves `model.onnx` and `tokenizer.json` to
