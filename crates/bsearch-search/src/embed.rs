@@ -57,12 +57,14 @@ impl Embedder {
         let token_type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
         let seq_len = input_ids.len();
 
-        let ids_tensor =
-            Tensor::from_array((vec![1, seq_len as i64], input_ids)).context("input_ids tensor")?;
-        let mask_tensor = Tensor::from_array((vec![1, seq_len as i64], attention_mask))
-            .context("attention_mask tensor")?;
-        let type_tensor = Tensor::from_array((vec![1, seq_len as i64], token_type_ids))
-            .context("token_type_ids tensor")?;
+        let ids_tensor = Tensor::from_array(([1usize, seq_len], input_ids.into_boxed_slice()))
+            .context("input_ids tensor")?;
+        let mask_tensor =
+            Tensor::from_array(([1usize, seq_len], attention_mask.into_boxed_slice()))
+                .context("attention_mask tensor")?;
+        let type_tensor =
+            Tensor::from_array(([1usize, seq_len], token_type_ids.into_boxed_slice()))
+                .context("token_type_ids tensor")?;
 
         let outputs = self.session.run(ort::inputs! {
             "input_ids" => ids_tensor,
@@ -71,15 +73,15 @@ impl Embedder {
         })?;
 
         // Output: last_hidden_state with shape (1, seq_len, 384)
-        let output_tensor = outputs[0]
+        let output_view = outputs[0]
             .try_extract_array::<f32>()
             .context("Failed to extract output tensor")?;
 
         // Reshape from (1, seq_len, 384) to (seq_len, 384)
-        let hidden_state = output_tensor
+        let hidden_state: Array2<f32> = output_view
             .into_shape_with_order((seq_len, 384))
-            .context("Failed to reshape hidden state")?;
-        let hidden_state: Array2<f32> = hidden_state.to_owned();
+            .context("Failed to reshape hidden state")?
+            .to_owned();
 
         // Build attention mask as f32 for mean pooling
         let mask_f32: Array1<f32> = encoding
