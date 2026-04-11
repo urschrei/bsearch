@@ -205,9 +205,13 @@ class Database:
     def clear_embeddings(self) -> int:
         """Remove all embeddings and reset posts for re-embedding.
 
+        Drops and recreates the vec_posts table to reclaim space (DELETE
+        on a vec0 virtual table does not release pages).
+
         Returns the number of posts that will need re-embedding.
         """
-        self.conn.execute("DELETE FROM vec_posts")
+        self.conn.execute("DROP TABLE IF EXISTS vec_posts")
+        self.conn.execute(VEC_TABLE_SQL)
         self.conn.execute("UPDATE posts SET has_embedding = 0")
         self.conn.commit()
         return self.conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
