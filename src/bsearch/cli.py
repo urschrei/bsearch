@@ -347,7 +347,7 @@ def export_model(output_dir: str | None):
             "token_type_ids": {0: "batch", 1: "sequence"},
             "last_hidden_state": {0: "batch", 1: "sequence"},
         },
-        opset_version=14,
+        opset_version=17,
     )
 
     # Save tokenizer files to the cache directory so the Rust binary can load them
