@@ -184,6 +184,49 @@ def vacuum():
     click.echo(f"Reclaimed: {saved:,} bytes")
 
 
+@cli.command()
+@click.option(
+    "--batch-size",
+    default=100,
+    type=int,
+    help="Number of posts to embed per batch.",
+)
+@click.pass_context
+def reindex(ctx, batch_size: int):
+    """Clear all embeddings and regenerate them from scratch."""
+    if not ctx.obj.get("verbose"):
+        logging.getLogger().setLevel(logging.INFO)
+
+    config = Config.from_env()
+    from bsearch.db import Database
+    from bsearch.embeddings import Embedder
+
+    db = Database(config.db_path)
+    total = db.clear_embeddings()
+    if total == 0:
+        click.echo("No posts to re-embed.")
+        db.close()
+        return
+
+    click.echo(f"Cleared embeddings. Re-embedding {total} posts...")
+    embedder = Embedder(config.embedding_model)
+
+    embedded = 0
+    while True:
+        pending = db.get_posts_without_embeddings(limit=batch_size)
+        if not pending:
+            break
+        ids, texts = zip(*pending, strict=True)
+        vectors = embedder.encode(list(texts))
+        embeddings = list(zip(ids, vectors, strict=True))
+        db.store_embeddings(embeddings)
+        embedded += len(embeddings)
+        click.echo(f"  {embedded}/{total} posts embedded")
+
+    db.close()
+    click.echo(f"Reindex complete. {embedded} embeddings generated.")
+
+
 @cli.command("export-model")
 @click.option(
     "--output-dir",

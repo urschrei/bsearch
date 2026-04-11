@@ -202,6 +202,16 @@ class Database:
             "cursor": cursor,
         }
 
+    def clear_embeddings(self) -> int:
+        """Remove all embeddings and reset posts for re-embedding.
+
+        Returns the number of posts that will need re-embedding.
+        """
+        self.conn.execute("DELETE FROM vec_posts")
+        self.conn.execute("UPDATE posts SET has_embedding = 0")
+        self.conn.commit()
+        return self.conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+
     def vacuum(self) -> None:
         """Reclaim unused space and defragment the database file."""
         self.conn.execute("VACUUM")
