@@ -6,6 +6,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SearchResult {
     pub id: i64,
     pub uri: String,
