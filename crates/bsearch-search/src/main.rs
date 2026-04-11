@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use colored::Colorize;
 
 #[derive(Parser)]
 #[command(
@@ -134,12 +135,18 @@ fn print_result(index: usize, r: &db::SearchResult) {
         String::new()
     };
 
-    println!("\n--- Result {index} ({score_info}) ---");
-    println!("Author:  {}", r.author_handle);
-    println!("Date:    {}", r.created_at);
-    println!("Source:  {}", r.source);
-    println!("Link:    {web_url}");
-    println!("Text:    {}", r.text);
+    println!(
+        "\n{} {} {} {}",
+        "---".bold(),
+        format!("Result {index}").white().bold(),
+        format!("({score_info})").yellow(),
+        "---".bold(),
+    );
+    println!("{}  {}", "Author:".dimmed(), r.author_handle.cyan());
+    println!("{}  {}", "Date:".dimmed(), r.created_at);
+    println!("{}  {}", "Source:".dimmed(), r.source.magenta());
+    println!("{}  {}", "Link:".dimmed(), web_url.blue().underline());
+    println!("{}  {}", "Text:".dimmed(), r.text);
 }
 
 #[cfg(test)]
