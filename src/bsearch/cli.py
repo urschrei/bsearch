@@ -292,6 +292,87 @@ def vacuum():
     click.echo(f"Reclaimed: {saved:,} bytes")
 
 
+@cli.command("export-model")
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default=None,
+    help="Output directory for ONNX model and tokenizer "
+    "(default: ~/.cache/bsearch/<model-name>).",
+)
+def export_model(output_dir: str | None):
+    """Export the embedding model to ONNX format for the Rust search binary."""
+    import shutil
+    from pathlib import Path
+
+    config = Config.from_env()
+
+    if output_dir is None:
+        cache_dir = Path.home() / ".cache" / "bsearch" / config.embedding_model
+    else:
+        cache_dir = Path(output_dir)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"Loading model '{config.embedding_model}'...")
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(config.embedding_model)
+
+    # Export to ONNX
+    onnx_path = cache_dir / "model.onnx"
+    click.echo(f"Exporting ONNX model to {onnx_path}...")
+
+    import torch
+
+    # Get the transformer module (first module in the SentenceTransformer pipeline)
+    transformer = model[0]
+    tokenizer = transformer.tokenizer
+    bert_model = transformer.auto_model
+
+    # Create dummy input
+    dummy_text = "This is a dummy sentence for tracing."
+    encoded = tokenizer(dummy_text, return_tensors="pt")
+
+    # Export
+    torch.onnx.export(
+        bert_model,
+        (encoded["input_ids"], encoded["attention_mask"], encoded["token_type_ids"]),
+        str(onnx_path),
+        input_names=["input_ids", "attention_mask", "token_type_ids"],
+        output_names=["last_hidden_state"],
+        dynamic_axes={
+            "input_ids": {0: "batch", 1: "sequence"},
+            "attention_mask": {0: "batch", 1: "sequence"},
+            "token_type_ids": {0: "batch", 1: "sequence"},
+            "last_hidden_state": {0: "batch", 1: "sequence"},
+        },
+        opset_version=14,
+    )
+
+    # Copy tokenizer.json from the HuggingFace cache
+    hf_tokenizer_path = None
+    model_name_or_path = transformer.model_name_or_path
+    if model_name_or_path and Path(model_name_or_path).is_dir():
+        candidate = Path(model_name_or_path) / "tokenizer.json"
+        if candidate.exists():
+            hf_tokenizer_path = candidate
+
+    if hf_tokenizer_path is None:
+        from huggingface_hub import hf_hub_download
+
+        hf_tokenizer_path = Path(
+            hf_hub_download(config.embedding_model, "tokenizer.json")
+        )
+
+    tokenizer_dest = cache_dir / "tokenizer.json"
+    shutil.copy2(hf_tokenizer_path, tokenizer_dest)
+
+    click.echo(f"Tokenizer saved to {tokenizer_dest}")
+    click.echo(f"\nExport complete. Model directory: {cache_dir}")
+    click.echo("The Rust binary will use this directory by default.")
+
+
 @cli.command("install-service")
 def install_service():
     """Generate and load a launchd plist for background operation."""
