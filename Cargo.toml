@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/bsearch-search"]
+resolver = "2"
