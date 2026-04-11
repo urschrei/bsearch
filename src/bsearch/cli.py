@@ -74,114 +74,6 @@ def serve(ctx):
 
 
 @cli.command()
-@click.argument("query", default="")
-@click.option("--limit", "-n", default=10, help="Number of results.")
-@click.option(
-    "--source",
-    "-s",
-    type=click.Choice(["own_post", "like", "backfill_post", "backfill_like"]),
-    default=None,
-    help="Filter by source type.",
-)
-@click.option(
-    "--mode",
-    "-m",
-    type=click.Choice(["hybrid", "keyword", "semantic"]),
-    default="hybrid",
-    help="Search mode: hybrid (default), keyword (FTS only), or semantic (vector only).",
-)
-@click.option(
-    "--handle",
-    "-a",
-    default=None,
-    help="Filter by author handle (e.g. alice.bsky.social). "
-    "With no query, lists all posts from this handle.",
-)
-def search(query: str, limit: int, source: str | None, mode: str, handle: str | None):
-    """Search across indexed posts."""
-    if not query and not handle:
-        click.echo("Provide a query and/or --handle to search.", err=True)
-        raise SystemExit(1)
-
-    config = Config.from_env()
-    from bsearch.db import Database
-
-    db = Database(config.db_path)
-
-    # No query text: list posts by handle
-    if not query:
-        assert handle is not None
-        results = db.list_by_handle(handle, limit=limit, source_filter=source)
-        if not results:
-            click.echo("No results found.")
-            db.close()
-            return
-
-        for i, r in enumerate(results, 1):
-            web_url = _at_uri_to_web_url(r["uri"])
-            click.echo(f"\n--- Result {i} ---")
-            click.echo(f"Author:  {r['author_handle']}")
-            click.echo(f"Date:    {r['created_at']}")
-            click.echo(f"Source:  {r['source']}")
-            click.echo(f"Link:    {web_url}")
-            click.echo(f"Text:    {r['text']}")
-
-        db.close()
-        return
-
-    query_embedding = None
-    if mode in ("hybrid", "semantic"):
-        from bsearch.embeddings import Embedder
-
-        embedder = Embedder(config.embedding_model, quiet=True)
-        query_embedding = embedder.encode_single(query)
-
-    if mode == "keyword":
-        results = db.search_fts(
-            query, limit=limit, source_filter=source, handle_filter=handle
-        )
-    elif mode == "semantic":
-        assert query_embedding is not None
-        results = db.search(
-            query_embedding, limit=limit, source_filter=source, handle_filter=handle
-        )
-    else:
-        results = db.search_hybrid(
-            query,
-            query_embedding,
-            limit=limit,
-            source_filter=source,
-            handle_filter=handle,
-        )
-
-    if not results:
-        click.echo("No results found.")
-        db.close()
-        return
-
-    for i, r in enumerate(results, 1):
-        web_url = _at_uri_to_web_url(r["uri"])
-
-        if mode == "hybrid" and "rrf_score" in r:
-            score_info = f"score: {r['rrf_score']:.4f}, match: {r['match_type']}"
-        elif mode == "keyword" and "bm25_rank" in r:
-            score_info = f"bm25: {r['bm25_rank']:.4f}"
-        elif "distance" in r:
-            score_info = f"distance: {r['distance']:.4f}"
-        else:
-            score_info = ""
-
-        click.echo(f"\n--- Result {i} ({score_info}) ---")
-        click.echo(f"Author:  {r['author_handle']}")
-        click.echo(f"Date:    {r['created_at']}")
-        click.echo(f"Source:  {r['source']}")
-        click.echo(f"Link:    {web_url}")
-        click.echo(f"Text:    {r['text']}")
-
-    db.close()
-
-
-@cli.command()
 @click.option("--limit", "-n", default=None, type=int, help="Max posts to fetch.")
 @click.pass_context
 def backfill(ctx, limit: int | None):
@@ -372,17 +264,6 @@ def uninstall_service():
     from bsearch.launchd import uninstall_plist
 
     uninstall_plist()
-
-
-def _at_uri_to_web_url(uri: str) -> str:
-    """Convert an at:// URI to a clickable bsky.app URL."""
-    # at://did:plc:abc/app.bsky.feed.post/rkey -> https://bsky.app/profile/did:plc:abc/post/rkey
-    if not uri.startswith("at://"):
-        return uri
-    parts = uri.removeprefix("at://").split("/")
-    if len(parts) >= 3 and parts[1] == "app.bsky.feed.post":
-        return f"https://bsky.app/profile/{parts[0]}/post/{parts[2]}"
-    return uri
 
 
 if __name__ == "__main__":
