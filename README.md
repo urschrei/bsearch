@@ -92,6 +92,7 @@ uv run bsearch install-service
 | `uv run bsearch backfill [-n LIMIT]` | Fetch historical posts and likes, generate embeddings |
 | `uv run bsearch serve` | Run the Jetstream listener in the foreground |
 | `uv run bsearch status` | Show database statistics and cursor position |
+| `uv run bsearch reindex [--batch-size N]` | Clear all embeddings and regenerate from scratch |
 | `uv run bsearch vacuum` | Reclaim unused database space |
 | `uv run bsearch export-model` | Export the embedding model to ONNX format |
 | `uv run bsearch install-service` | Install and start a launchd agent for background operation |
@@ -113,6 +114,7 @@ bsearch-search [OPTIONS] [QUERY]
 | `-a`, `--handle` | Filter by author handle; with no query, lists posts from that handle |
 | `--db` | Database path (default: `./bsearch.db`, env: `BSEARCH_DB_PATH`) |
 | `--model` | Model directory (default: `~/.cache/bsearch/all-MiniLM-L6-v2`, env: `BSEARCH_MODEL_DIR`) |
+| `--max-semantic-distance` | L2 distance threshold for semantic-only results in hybrid mode (default: 1.05) |
 
 The binary requires the ONNX Runtime shared library. Set `ORT_DYLIB_PATH` to point to it -- the one bundled with the Python `onnxruntime` package (installed as a dev dependency) works. See `crates/bsearch-search/README.md` for details on the embedding pipeline.
 
