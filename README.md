@@ -9,10 +9,11 @@ A local tool that monitors a Bluesky account via [Jetstream](https://github.com/
 - Likes arrive as references only -- the liked post's text is resolved in batches via the AT Protocol API
 - Post text is embedded using `sentence-transformers` (`all-MiniLM-L6-v2`, 384 dimensions) and stored in a `sqlite-vec` virtual table for KNN vector search
 - Embeddings are generated periodically in the background, not blocking the event stream
+- Search is handled by a fast Rust binary (`bsearch-search`) using ONNX Runtime, with sub-second cold start
 
 ## Setup
 
-Requires Python 3.13+. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
+Requires Python 3.13+ and Rust. Python dependencies are managed with [uv](https://docs.astral.sh/uv/).
 
 ```
 uv sync
@@ -44,19 +45,34 @@ uv run bsearch init
 | `bsearch init` | Verify credentials and resolve your DID |
 | `bsearch backfill` | Fetch historical posts and likes via the API, generate embeddings |
 | `bsearch serve` | Run the Jetstream listener in the foreground |
-| `bsearch search "query"` | Semantic search across all indexed posts |
 | `bsearch status` | Show database statistics and cursor position |
+| `bsearch export-model` | Export the embedding model to ONNX format for the search binary |
 | `bsearch install-service` | Install and start a launchd agent for background operation |
 | `bsearch uninstall-service` | Stop and remove the launchd agent |
 
-### Search options
+## Search
+
+Search is handled by a standalone Rust binary for fast startup. One-time setup:
 
 ```
-bsearch search "query" [-n LIMIT] [-s SOURCE]
+uv run bsearch export-model
+cargo build -p bsearch-search --release
+```
+
+Then search with:
+
+```
+bsearch-search "query" [-n LIMIT] [-s SOURCE] [-m MODE] [-a HANDLE]
 ```
 
 - `-n` / `--limit`: number of results (default 10)
 - `-s` / `--source`: filter by source type (`own_post`, `like`, `backfill_post`, `backfill_like`)
+- `-m` / `--mode`: search mode -- `hybrid` (default), `keyword` (FTS only), or `semantic` (vector only)
+- `-a` / `--handle`: filter by author handle; with no query, lists all posts from that handle
+
+The binary requires the ONNX Runtime shared library at runtime. Set `ORT_DYLIB_PATH` to point to it (the one bundled with the Python `onnxruntime` package works).
+
+See `crates/bsearch-search/README.md` for more details on the embedding pipeline.
 
 ### Backfill options
 
