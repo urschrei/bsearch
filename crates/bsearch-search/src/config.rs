@@ -16,8 +16,11 @@ impl Config {
             .or_else(|| std::env::var("BSEARCH_DB_PATH").ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("bsearch.db"));
 
-        let default_model_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from(".cache"))
+        // Use ~/.cache/bsearch/ to match the Python export-model command,
+        // which uses the XDG convention rather than the macOS Library/Caches path.
+        let default_model_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".cache")
             .join("bsearch")
             .join("all-MiniLM-L6-v2");
 
