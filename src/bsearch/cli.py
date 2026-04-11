@@ -302,7 +302,6 @@ def vacuum():
 )
 def export_model(output_dir: str | None):
     """Export the embedding model to ONNX format for the Rust search binary."""
-    import shutil
     from pathlib import Path
 
     config = Config.from_env()
@@ -328,9 +327,10 @@ def export_model(output_dir: str | None):
     # Get the transformer module (first module in the SentenceTransformer pipeline)
     transformer = model[0]
     tokenizer = transformer.tokenizer
-    bert_model = transformer.auto_model
+    # Move model to CPU for export; ONNX export does not support MPS
+    bert_model = transformer.auto_model.cpu()
 
-    # Create dummy input
+    # Create dummy input (keep on CPU to match model)
     dummy_text = "This is a dummy sentence for tracing."
     encoded = tokenizer(dummy_text, return_tensors="pt")
 
@@ -350,25 +350,10 @@ def export_model(output_dir: str | None):
         opset_version=14,
     )
 
-    # Copy tokenizer.json from the HuggingFace cache
-    hf_tokenizer_path = None
-    model_name_or_path = transformer.model_name_or_path
-    if model_name_or_path and Path(model_name_or_path).is_dir():
-        candidate = Path(model_name_or_path) / "tokenizer.json"
-        if candidate.exists():
-            hf_tokenizer_path = candidate
+    # Save tokenizer files to the cache directory so the Rust binary can load them
+    click.echo(f"Saving tokenizer to {cache_dir}...")
+    tokenizer.save_pretrained(str(cache_dir))
 
-    if hf_tokenizer_path is None:
-        from huggingface_hub import hf_hub_download
-
-        hf_tokenizer_path = Path(
-            hf_hub_download(config.embedding_model, "tokenizer.json")
-        )
-
-    tokenizer_dest = cache_dir / "tokenizer.json"
-    shutil.copy2(hf_tokenizer_path, tokenizer_dest)
-
-    click.echo(f"Tokenizer saved to {tokenizer_dest}")
     click.echo(f"\nExport complete. Model directory: {cache_dir}")
     click.echo("The Rust binary will use this directory by default.")
 
