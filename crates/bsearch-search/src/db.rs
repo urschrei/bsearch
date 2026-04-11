@@ -260,10 +260,15 @@ impl Database {
         // Both have results: compute RRF scores
         // k=60 is the standard RRF constant
         const K: f64 = 60.0;
+        // Maximum L2 distance for semantic-only results to be included.
+        // Embeddings are L2-normalised, so distances range from 0 (identical)
+        // to 2 (opposite). 1.05 admits only close semantic matches.
+        const MAX_SEMANTIC_DISTANCE: f64 = 1.05;
 
         let mut rrf_scores: BTreeMap<i64, f64> = BTreeMap::new();
         let mut has_keyword: BTreeMap<i64, bool> = BTreeMap::new();
         let mut has_semantic: BTreeMap<i64, bool> = BTreeMap::new();
+        let mut vec_distance: BTreeMap<i64, f64> = BTreeMap::new();
         // Keep one representative SearchResult per doc id
         let mut result_map: BTreeMap<i64, SearchResult> = BTreeMap::new();
 
@@ -278,20 +283,37 @@ impl Database {
             let score = 1.0 / (K + (rank + 1) as f64);
             *rrf_scores.entry(r.id).or_insert(0.0) += score;
             has_semantic.insert(r.id, true);
+            if let Some(d) = r.distance {
+                vec_distance.insert(r.id, d);
+            }
             result_map.entry(r.id).or_insert(r);
         }
 
-        // Keep only results that appear in both keyword and semantic rankings.
-        // Single-source results (keyword-only or semantic-only) are often
-        // noise, especially for short or specific queries.
-        let intersection_ids: Vec<i64> = rrf_scores
+        // Include a result if it has a keyword match, OR if it is a
+        // semantic-only match whose embedding distance is below the threshold.
+        // This lets semantic search surface genuinely close results that use
+        // different words, while filtering out the noise that appears when
+        // the embedding is too vague to discriminate.
+        let candidate_ids: Vec<i64> = rrf_scores
             .keys()
-            .filter(|id| has_keyword.contains_key(id) && has_semantic.contains_key(id))
+            .filter(|id| {
+                let kw = has_keyword.contains_key(id);
+                let sem = has_semantic.contains_key(id);
+                if kw {
+                    return true;
+                }
+                if sem {
+                    if let Some(&d) = vec_distance.get(id) {
+                        return d <= MAX_SEMANTIC_DISTANCE;
+                    }
+                }
+                false
+            })
             .copied()
             .collect();
 
         // Sort by RRF score descending
-        let mut scored: Vec<(i64, f64)> = intersection_ids
+        let mut scored: Vec<(i64, f64)> = candidate_ids
             .into_iter()
             .map(|id| (id, rrf_scores[&id]))
             .collect();
@@ -302,7 +324,14 @@ impl Database {
         for (id, score) in scored {
             if let Some(mut r) = result_map.remove(&id) {
                 r.rrf_score = Some(score);
-                r.match_type = Some(MatchType::KeywordAndSemantic);
+                let kw = has_keyword.contains_key(&id);
+                let sem = has_semantic.contains_key(&id);
+                r.match_type = Some(match (kw, sem) {
+                    (true, true) => MatchType::KeywordAndSemantic,
+                    (true, false) => MatchType::Keyword,
+                    (false, true) => MatchType::Semantic,
+                    (false, false) => unreachable!(),
+                });
                 out.push(r);
             }
         }
