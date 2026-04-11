@@ -281,8 +281,20 @@ impl Database {
             result_map.entry(r.id).or_insert(r);
         }
 
+        // Keep only results that appear in both keyword and semantic rankings.
+        // Single-source results (keyword-only or semantic-only) are often
+        // noise, especially for short or specific queries.
+        let intersection_ids: Vec<i64> = rrf_scores
+            .keys()
+            .filter(|id| has_keyword.contains_key(id) && has_semantic.contains_key(id))
+            .copied()
+            .collect();
+
         // Sort by RRF score descending
-        let mut scored: Vec<(i64, f64)> = rrf_scores.into_iter().collect();
+        let mut scored: Vec<(i64, f64)> = intersection_ids
+            .into_iter()
+            .map(|id| (id, rrf_scores[&id]))
+            .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
@@ -290,14 +302,7 @@ impl Database {
         for (id, score) in scored {
             if let Some(mut r) = result_map.remove(&id) {
                 r.rrf_score = Some(score);
-                let kw = has_keyword.contains_key(&id);
-                let sem = has_semantic.contains_key(&id);
-                r.match_type = Some(match (kw, sem) {
-                    (true, true) => MatchType::KeywordAndSemantic,
-                    (true, false) => MatchType::Keyword,
-                    (false, true) => MatchType::Semantic,
-                    (false, false) => unreachable!(),
-                });
+                r.match_type = Some(MatchType::KeywordAndSemantic);
                 out.push(r);
             }
         }
