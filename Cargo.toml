@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bsearch-core", "crates/bsearch-search"]
+members = ["crates/bsearch-core", "crates/bsearch-search", "crates/bsearch-serve"]
 resolver = "2"
 
 [workspace.package]
