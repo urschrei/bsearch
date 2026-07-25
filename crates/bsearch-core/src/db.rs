@@ -7,6 +7,63 @@ use anyhow::Context;
 use anyhow::Result;
 use rusqlite::Connection;
 use rusqlite::OpenFlags;
+use rusqlite::OptionalExtension;
+
+use crate::models::Post;
+
+/// Schema statements, kept byte-for-byte in step with `src/bsearch/db.py`.
+/// Both the daemon and the Python CLI may be the first to touch a fresh
+/// database, so they must agree on exactly what they create.
+const SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uri TEXT UNIQUE NOT NULL,
+    cid TEXT NOT NULL,
+    author_did TEXT NOT NULL,
+    author_handle TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    has_embedding INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_source ON posts(source);
+CREATE INDEX IF NOT EXISTS idx_posts_has_embedding ON posts(has_embedding);
+";
+
+const VEC_TABLE_SQL: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_posts USING vec0(
+    embedding float[384]
+);
+";
+
+const FTS_SCHEMA_SQL: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_posts USING fts5(
+    text,
+    content=posts,
+    content_rowid=id,
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS posts_ai AFTER INSERT ON posts BEGIN
+    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS posts_ad AFTER DELETE ON posts BEGIN
+    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS posts_au AFTER UPDATE ON posts BEGIN
+    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
+    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+END;
+";
 
 /// Describes which retrieval method(s) contributed to a search result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +105,7 @@ pub struct Database {
 }
 
 impl Database {
+    /// Open the database read-only, for search.
     pub fn open(path: &Path) -> Result<Self> {
         register_sqlite_vec();
         let conn = Connection::open_with_flags(
@@ -56,6 +114,154 @@ impl Database {
         )?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         Ok(Self { conn })
+    }
+
+    /// Open the database read-write and ensure the schema exists, for ingest.
+    ///
+    /// The pragmas mirror `Database._connect` in `src/bsearch/db.py` so that
+    /// the daemon and the Python CLI behave identically against the same file.
+    pub fn open_read_write(path: &Path) -> Result<Self> {
+        register_sqlite_vec();
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "temp_store", "memory")?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+
+        let db = Self { conn };
+        db.init_schema()?;
+        Ok(db)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        self.conn
+            .execute_batch(SCHEMA_SQL)
+            .context("failed to create base schema")?;
+        self.conn
+            .execute_batch(VEC_TABLE_SQL)
+            .context("failed to create vec_posts table")?;
+        self.conn
+            .execute_batch(FTS_SCHEMA_SQL)
+            .context("failed to create FTS schema")?;
+        self.ensure_fts_populated()?;
+        Ok(())
+    }
+
+    /// Port of `Database._ensure_fts_populated` in `src/bsearch/db.py`.
+    ///
+    /// For an external-content FTS5 table, `count(*)` reads through to the
+    /// content table rather than the index, so the two cannot be compared.
+    /// Python instead records a flag once the index is known to be good; we
+    /// honour the same flag, both so a Rust-created database does not provoke
+    /// a needless rebuild the next time the Python CLI opens it, and so we
+    /// still repair an older database that predates the flag.
+    fn ensure_fts_populated(&self) -> Result<()> {
+        let initialised: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'fts_initialized'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if initialised.is_some() {
+            return Ok(());
+        }
+
+        let posts_count: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM posts", [], |row| row.get(0))?;
+        if posts_count > 0 {
+            self.conn
+                .execute("INSERT INTO fts_posts(fts_posts) VALUES('rebuild')", [])
+                .context("failed to rebuild FTS index")?;
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('fts_initialized', '1')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a post, returning its rowid, or `None` if the URI already exists.
+    ///
+    /// The FTS index is maintained by the `posts_ai` trigger, so no separate
+    /// write is needed here.
+    pub fn insert_post(&self, post: &Post) -> Result<Option<i64>> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO posts
+                 (uri, cid, author_did, author_handle, text, created_at, source, indexed_at, has_embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            rusqlite::params![
+                post.uri,
+                post.cid,
+                post.author_did,
+                post.author_handle,
+                post.text,
+                post.created_at,
+                post.source,
+                post.indexed_at,
+            ],
+        )?;
+
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.conn.last_insert_rowid()))
+    }
+
+    /// Return `(id, text)` for posts that still need an embedding.
+    pub fn get_posts_without_embeddings(&self, limit: usize) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, text FROM posts WHERE has_embedding = 0 LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Store embeddings and flag the corresponding posts as embedded.
+    ///
+    /// Runs as a single transaction so that `vec_posts` and `posts.has_embedding`
+    /// cannot disagree if the process dies mid-batch.
+    pub fn store_embeddings(&mut self, embeddings: &[(i64, [f32; 384])]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (post_id, embedding) in embeddings {
+            let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT INTO vec_posts (rowid, embedding) VALUES (?1, ?2)",
+                rusqlite::params![post_id, bytes],
+            )?;
+            tx.execute(
+                "UPDATE posts SET has_embedding = 1 WHERE id = ?1",
+                [post_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read the stored Jetstream cursor (microseconds since the epoch).
+    pub fn get_cursor(&self) -> Result<Option<i64>> {
+        let value: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'cursor'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        // The Python code stores this as text; tolerate a malformed value
+        // rather than refusing to start.
+        Ok(value.and_then(|v| v.parse::<i64>().ok()))
+    }
+
+    /// Persist the Jetstream cursor.
+    pub fn set_cursor(&self, cursor: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('cursor', ?1)",
+            [cursor.to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn search_fts(
@@ -670,6 +876,188 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].uri, "uri:1");
         assert_eq!(results[0].match_type, Some(MatchType::Keyword));
+    }
+
+    /// A post with the given URI and text, with all other fields stubbed.
+    fn sample_post(uri: &str, text: &str) -> Post {
+        Post::new(
+            uri.to_string(),
+            "cid1".to_string(),
+            "did:plc:abc".to_string(),
+            "alice.bsky.social".to_string(),
+            text.to_string(),
+            "2026-03-29T03:11:21.467000+00:00".to_string(),
+            crate::models::Source::OwnPost,
+        )
+    }
+
+    fn empty_db() -> (NamedTempFile, PathBuf) {
+        let file = NamedTempFile::new().expect("failed to create temp file");
+        let path = file.path().to_path_buf();
+        (file, path)
+    }
+
+    #[test]
+    fn test_open_read_write_creates_schema() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        // Opening a second time must be a no-op, not an error.
+        drop(db);
+        Database::open_read_write(&path).expect("reopen failed");
+    }
+
+    /// The daemon and the Python CLI write to the same file, and either may be
+    /// the one to create it. This pins the objects we create to exactly the set
+    /// `src/bsearch/db.py` produces for a fresh database.
+    #[test]
+    fn test_schema_matches_python() {
+        let (_file, path) = empty_db();
+        Database::open_read_write(&path).expect("open failed");
+
+        let conn = Connection::open(&path).expect("failed to reopen");
+        let mut stmt = conn
+            .prepare("SELECT type || ' ' || name FROM sqlite_master ORDER BY type, name")
+            .expect("prepare failed");
+        let objects: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query failed")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect failed");
+
+        let expected = vec![
+            "index idx_posts_has_embedding",
+            "index idx_posts_source",
+            "index sqlite_autoindex_meta_1",
+            "index sqlite_autoindex_posts_1",
+            "index sqlite_autoindex_vec_posts_info_1",
+            "index sqlite_autoindex_vec_posts_vector_chunks00_1",
+            "table fts_posts",
+            "table fts_posts_config",
+            "table fts_posts_data",
+            "table fts_posts_docsize",
+            "table fts_posts_idx",
+            "table meta",
+            "table posts",
+            "table sqlite_sequence",
+            "table vec_posts",
+            "table vec_posts_chunks",
+            "table vec_posts_info",
+            "table vec_posts_rowids",
+            "table vec_posts_vector_chunks00",
+            "trigger posts_ad",
+            "trigger posts_ai",
+            "trigger posts_au",
+        ];
+        assert_eq!(objects, expected);
+    }
+
+    #[test]
+    fn test_fresh_db_marks_fts_initialised() {
+        let (_file, path) = empty_db();
+        Database::open_read_write(&path).expect("open failed");
+
+        let conn = Connection::open(&path).expect("failed to reopen");
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'fts_initialized'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("flag should be set so the Python CLI does not rebuild");
+        assert_eq!(flag, "1");
+    }
+
+    #[test]
+    fn test_insert_post_returns_rowid_then_none_on_duplicate() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+
+        let post = sample_post("at://uri/1", "hello world");
+        let id = db.insert_post(&post).expect("insert failed");
+        assert_eq!(id, Some(1));
+
+        // Replayed events (e.g. after a Jetstream reconnect) must be ignored.
+        let again = db.insert_post(&post).expect("second insert failed");
+        assert_eq!(again, None, "duplicate URI should be ignored");
+    }
+
+    #[test]
+    fn test_insert_post_populates_fts() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.insert_post(&sample_post("at://uri/1", "unmistakable phrase"))
+            .expect("insert failed");
+        drop(db);
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_fts("unmistakable", 10, None, None)
+            .expect("search failed");
+        assert_eq!(results.len(), 1, "trigger should have indexed the post");
+        assert_eq!(results[0].uri, "at://uri/1");
+    }
+
+    #[test]
+    fn test_embedding_round_trip() {
+        let (_file, path) = empty_db();
+        let mut db = Database::open_read_write(&path).expect("open failed");
+        let id = db
+            .insert_post(&sample_post("at://uri/1", "some text"))
+            .expect("insert failed")
+            .expect("expected a rowid");
+
+        let pending = db.get_posts_without_embeddings(100).expect("query failed");
+        assert_eq!(pending, vec![(id, "some text".to_string())]);
+
+        let mut embedding = [0.0f32; 384];
+        embedding[0] = 1.0;
+        db.store_embeddings(&[(id, embedding)])
+            .expect("store failed");
+
+        let pending = db.get_posts_without_embeddings(100).expect("query failed");
+        assert!(pending.is_empty(), "post should be marked as embedded");
+        drop(db);
+
+        // And it should now be findable by vector search.
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_vec(&embedding, 10, None, None)
+            .expect("vec search failed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].uri, "at://uri/1");
+    }
+
+    #[test]
+    fn test_get_posts_without_embeddings_respects_limit() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        for i in 0..5 {
+            db.insert_post(&sample_post(&format!("at://uri/{i}"), "text"))
+                .expect("insert failed");
+        }
+        let pending = db.get_posts_without_embeddings(3).expect("query failed");
+        assert_eq!(pending.len(), 3);
+    }
+
+    #[test]
+    fn test_cursor_round_trip() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+
+        assert_eq!(db.get_cursor().expect("read failed"), None);
+
+        db.set_cursor(1_722_000_000_000_000).expect("write failed");
+        assert_eq!(
+            db.get_cursor().expect("read failed"),
+            Some(1_722_000_000_000_000)
+        );
+
+        // Overwrite rather than accumulate rows.
+        db.set_cursor(1_722_000_000_000_001).expect("write failed");
+        assert_eq!(
+            db.get_cursor().expect("read failed"),
+            Some(1_722_000_000_000_001)
+        );
     }
 
     #[test]
