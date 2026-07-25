@@ -1,11 +1,11 @@
-mod config;
-mod db;
-mod embed;
-
 use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
+use bsearch_core::config;
+use bsearch_core::db;
+use bsearch_core::embed;
+use bsearch_core::models::Source;
 use clap::Parser;
 use clap::ValueEnum;
 use colored::Colorize;
@@ -27,12 +27,15 @@ enum SourceType {
 
 impl SourceType {
     fn as_str(&self) -> &'static str {
+        // Delegate so the CLI filter values and the strings written to
+        // `posts.source` by the daemon cannot drift apart.
         match self {
-            Self::OwnPost => "own_post",
-            Self::Like => "like",
-            Self::BackfillPost => "backfill_post",
-            Self::BackfillLike => "backfill_like",
+            Self::OwnPost => Source::OwnPost,
+            Self::Like => Source::Like,
+            Self::BackfillPost => Source::BackfillPost,
+            Self::BackfillLike => Source::BackfillLike,
         }
+        .as_str()
     }
 }
 

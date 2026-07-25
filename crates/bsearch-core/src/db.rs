@@ -30,15 +30,12 @@ impl fmt::Display for MatchType {
 pub struct SearchResult {
     pub id: i64,
     pub uri: String,
-    #[allow(dead_code)] // fetched from DB for completeness, not currently displayed
     pub cid: String,
-    #[allow(dead_code)] // fetched from DB for completeness, not currently displayed
     pub author_did: String,
     pub author_handle: String,
     pub text: String,
     pub created_at: String,
     pub source: String,
-    #[allow(dead_code)] // fetched from DB for completeness, not currently displayed
     pub indexed_at: String,
     pub distance: Option<f64>,
     pub bm25_rank: Option<f64>,

@@ -1,6 +1,23 @@
 [workspace]
-members = ["crates/bsearch-search"]
+members = ["crates/bsearch-core", "crates/bsearch-search"]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+rusqlite = { version = "0.34", features = ["bundled", "load_extension"] }
+sqlite-vec = "0.1"
+tokenizers = "0.21"
+dotenvy = "0.15"
+dirs = "6"
+chrono = "0.4"
+tempfile = "3"
+serial_test = "3"
 
 [profile.release]
 strip = true

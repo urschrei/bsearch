@@ -1,0 +1,19 @@
+[package]
+name = "bsearch-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+dotenvy.workspace = true
+ndarray.workspace = true
+ort.workspace = true
+rusqlite.workspace = true
+sqlite-vec.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tempfile.workspace = true

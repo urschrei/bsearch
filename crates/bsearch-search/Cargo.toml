@@ -1,20 +1,10 @@
 [package]
 name = "bsearch-search"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
+bsearch-core = { path = "../bsearch-core" }
+anyhow.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
-tokenizers = "0.21"
-rusqlite = { version = "0.34", features = ["bundled", "load_extension"] }
-sqlite-vec = "0.1"
-ndarray = "0.17"
-dotenvy = "0.15"
-dirs = "6"
-anyhow = "1"
 colored = "3"
-
-[dev-dependencies]
-tempfile = "3"
-serial_test = "3"

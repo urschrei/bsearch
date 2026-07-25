@@ -118,13 +118,21 @@ pub fn mean_pool(hidden_state: &Array2<f32>, attention_mask: &Array1<f32>) -> Ar
     let masked = hidden_state * &mask_col;
     let sum = masked.sum_axis(ndarray::Axis(0));
     let mask_sum = attention_mask.sum();
-    if mask_sum > 0.0 { sum / mask_sum } else { sum }
+    if mask_sum > 0.0 {
+        sum / mask_sum
+    } else {
+        sum
+    }
 }
 
 /// L2-normalise a vector, returning a unit vector.
 pub fn l2_normalise(v: &Array1<f32>) -> Array1<f32> {
     let norm = v.dot(v).sqrt();
-    if norm > 0.0 { v / norm } else { v.clone() }
+    if norm > 0.0 {
+        v / norm
+    } else {
+        v.clone()
+    }
 }
 
 #[cfg(test)]
