@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from textwrap import dedent
 
@@ -16,15 +14,22 @@ LOG_DIR = Path.home() / "Library" / "Logs" / "bsearch"
 
 
 def _find_bsearch_executable() -> str:
-    """Find the bsearch executable path."""
-    bsearch_path = shutil.which("bsearch")
-    if bsearch_path:
-        return bsearch_path
-    # Fall back to the venv's bin directory
-    venv_path = Path(sys.executable).parent / "bsearch"
-    if venv_path.exists():
-        return str(venv_path)
-    msg = "Cannot find bsearch executable"
+    """Find the bsearch-serve binary.
+
+    The daemon is the Rust binary, not this Python package: it does the same
+    work in roughly 20 MB rather than 2.5 GB, because it embeds via ONNX
+    Runtime instead of loading PyTorch.
+    """
+    local_build = Path.cwd() / "target" / "release" / "bsearch-serve"
+    if local_build.exists():
+        return str(local_build)
+    on_path = shutil.which("bsearch-serve")
+    if on_path:
+        return on_path
+    msg = (
+        "Cannot find the bsearch-serve binary. Build it first:\n"
+        "    cargo build --release -p bsearch-serve"
+    )
     raise FileNotFoundError(msg)
 
 
@@ -41,7 +46,6 @@ def _generate_plist(executable: str, working_dir: str) -> str:
             <key>ProgramArguments</key>
             <array>
                 <string>{executable}</string>
-                <string>serve</string>
             </array>
             <key>WorkingDirectory</key>
             <string>{working_dir}</string>
@@ -56,7 +60,7 @@ def _generate_plist(executable: str, working_dir: str) -> str:
             <key>EnvironmentVariables</key>
             <dict>
                 <key>PATH</key>
-                <string>{os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin")}</string>
+                <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
             </dict>
         </dict>
         </plist>

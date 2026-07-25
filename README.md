@@ -7,9 +7,17 @@ A local tool that monitors a Bluesky account via [Jetstream](https://github.com/
 - Connects to the Bluesky Jetstream firehose, filtered to a single account's DID
 - Own posts arrive directly in the event stream with full text
 - Likes arrive as references only -- the liked post's text is resolved in batches via the AT Protocol API
-- Post text is embedded using `sentence-transformers` (`all-MiniLM-L6-v2`, 384 dimensions) and stored in a `sqlite-vec` virtual table for KNN vector search
+- Post text is embedded with `all-MiniLM-L6-v2` (384 dimensions) and stored in a `sqlite-vec` virtual table for KNN vector search
 - Embeddings are generated periodically in the background, not blocking the event stream
-- Search is handled by a fast Rust binary (`bsearch-search`) using ONNX Runtime, with sub-second cold start
+- Both the background daemon (`bsearch-serve`) and search (`bsearch-search`) are Rust binaries running the model through ONNX Runtime, statically linked so they have no runtime dependencies
+- Python remains for one-off commands: setup, backfill, model export and maintenance
+
+The daemon is written in Rust because it is long-lived. The equivalent Python
+service held around 2.5 GB resident, most of it PyTorch and the Metal/MPS
+allocations `sentence-transformers` makes on Apple Silicon, to embed a handful
+of short posts every ten seconds. The Rust daemon idles at roughly 20 MB,
+loading the ONNX session only when there are posts to embed and dropping it
+again after five minutes idle.
 
 ## Setup
 
@@ -42,14 +50,18 @@ pds_url=https://pds.example.com
 uv run bsearch init
 ```
 
-### 4. Build the search binary
+### 4. Build the Rust binaries
 
-Export the embedding model to ONNX format, then build the Rust binary:
+Export the embedding model to ONNX format, then build:
 
 ```
 uv run bsearch export-model
-cargo build -p bsearch-search --release
+cargo build --release
 ```
+
+This produces `target/release/bsearch-search` and `target/release/bsearch-serve`.
+ONNX Runtime is linked statically, so neither needs anything else installed at
+runtime.
 
 ## Getting started
 
@@ -62,25 +74,28 @@ uv run bsearch backfill
 Then search:
 
 ```
-ORT_DYLIB_PATH=.venv/lib/python3.13/site-packages/onnxruntime/capi/libonnxruntime.1.24.4.dylib \
-  ./target/release/bsearch-search "your query"
+./target/release/bsearch-search "your query"
 ```
 
-To avoid typing the `ORT_DYLIB_PATH` each time, add a shell alias (adjust paths if needed):
+A shell alias saves typing the paths:
 
 ```sh
-alias bss='ORT_DYLIB_PATH=/path/to/bsearch/.venv/lib/python3.13/site-packages/onnxruntime/capi/libonnxruntime.1.24.4.dylib /path/to/bsearch/target/release/bsearch-search --db /path/to/bsearch/bsearch.db'
+alias bss='/path/to/bsearch/target/release/bsearch-search --db /path/to/bsearch/bsearch.db'
 ```
 
 Then simply: `bss "your query"`.
 
-To keep the database up to date continuously, run the Jetstream listener in the foreground or install it as a background service:
+To keep the database up to date continuously, run the daemon in the foreground
+or install it as a background service:
 
 ```
-uv run bsearch serve
+./target/release/bsearch-serve
 # or
 uv run bsearch install-service
 ```
+
+`install-service` writes a launchd agent pointing at
+`target/release/bsearch-serve`, so build it first.
 
 ## Commands
 
@@ -90,7 +105,7 @@ uv run bsearch install-service
 |---|---|
 | `uv run bsearch init` | Verify credentials and resolve your DID |
 | `uv run bsearch backfill [-n LIMIT]` | Fetch historical posts and likes, generate embeddings |
-| `uv run bsearch serve` | Run the Jetstream listener in the foreground |
+| `uv run bsearch serve` | Run the Jetstream listener in the foreground (superseded by `bsearch-serve`) |
 | `uv run bsearch status` | Show database statistics and cursor position |
 | `uv run bsearch reindex [--batch-size N]` | Clear all embeddings and regenerate from scratch |
 | `uv run bsearch vacuum` | Reclaim unused database space |
@@ -116,7 +131,18 @@ bsearch-search [OPTIONS] [QUERY]
 | `--model` | Model directory (default: `~/.cache/bsearch/all-MiniLM-L6-v2`, env: `BSEARCH_MODEL_DIR`) |
 | `--max-semantic-distance` | L2 distance threshold for semantic-only results in hybrid mode (default: 1.05) |
 
-The binary requires the ONNX Runtime shared library. Set `ORT_DYLIB_PATH` to point to it -- the one bundled with the Python `onnxruntime` package (installed as a dev dependency) works. See `crates/bsearch-search/README.md` for details on the embedding pipeline.
+See `crates/bsearch-search/README.md` for details on the embedding pipeline.
+
+### Daemon
+
+```
+bsearch-serve
+```
+
+Takes no arguments; it reads `.env` from the working directory, using the same
+keys as the Python CLI. `BSEARCH_DB_PATH` and `BSEARCH_MODEL_DIR` override the
+database and model locations, and `RUST_LOG` controls logging (default
+`info,ort=warn`).
 
 ## Service logs
 

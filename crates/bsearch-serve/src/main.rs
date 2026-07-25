@@ -27,10 +27,13 @@ pub fn notify(title: &str, message: &str) {
 }
 
 fn main() -> Result<()> {
+    // ONNX Runtime logs its entire graph-optimisation pass at INFO, which is
+    // hundreds of lines every time a session is loaded, so it is pinned to
+    // warn unless RUST_LOG says otherwise.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ort=warn")),
         )
         .init();
 
