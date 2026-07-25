@@ -32,8 +32,13 @@ impl Embedder {
             tokenizer_path.display()
         );
 
+        // One intra-op thread: we embed single short texts, where the default
+        // one-thread-per-core pool costs thread stacks and scheduling overhead
+        // without buying any parallelism worth having.
         let session = Session::builder()
             .context("Failed to create ONNX Runtime session builder")?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("Failed to set ONNX Runtime thread count: {e}"))?
             .commit_from_file(&model_path)
             .with_context(|| format!("Failed to load ONNX model from {}", model_path.display()))?;
 

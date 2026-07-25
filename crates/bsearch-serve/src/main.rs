@@ -6,11 +6,13 @@ use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
 use atproto_jetstream::CancellationToken;
 use bsearch_core::db::Database;
+use bsearch_core::embed::Embedder;
 use tokio::sync::Mutex;
 
 /// Send a macOS notification, as `_notify` does in `src/bsearch/jetstream.py`.
@@ -72,11 +74,108 @@ async fn run() -> Result<()> {
         resolver,
         token.clone(),
     ));
+    let embeddings = tokio::spawn(embedding_loop(config.clone(), db.clone(), token.clone()));
 
     jetstream::run(&config, db, handler, token).await?;
     likes.await??;
+    embeddings.await??;
 
     tracing::info!("Service stopped");
+    Ok(())
+}
+
+/// How many posts to embed per batch, matching the Python default.
+const EMBEDDING_BATCH_SIZE: usize = 100;
+
+/// Periodically embed any posts that lack an embedding.
+///
+/// Port of `Service._generate_embeddings_loop`, with one addition: the ONNX
+/// session is loaded on demand and dropped again once the loop has been idle
+/// for `embedder_idle_timeout`. Reloading takes well under a second, and this
+/// is the difference between an idle daemon holding roughly 20 MB and 90 MB.
+async fn embedding_loop(
+    config: config::Config,
+    db: Arc<Mutex<Database>>,
+    token: CancellationToken,
+) -> Result<()> {
+    let interval = Duration::from_secs(config.embedding_batch_interval);
+    let idle_timeout = Duration::from_secs(config.embedder_idle_timeout);
+    let mut embedder: Option<Embedder> = None;
+    let mut idle_since: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            () = token.cancelled() => break,
+            () = tokio::time::sleep(interval) => {}
+        }
+
+        let pending = {
+            let db = db.lock().await;
+            db.get_posts_without_embeddings(EMBEDDING_BATCH_SIZE)?
+        };
+
+        if pending.is_empty() {
+            let idle_long_enough = idle_since.is_some_and(|since| since.elapsed() >= idle_timeout);
+            if embedder.is_some() && idle_long_enough {
+                embedder = None;
+                idle_since = None;
+                tracing::debug!("Dropped idle ONNX session");
+            }
+            continue;
+        }
+
+        if embedder.is_none() {
+            match Embedder::load(&config.model_dir) {
+                Ok(e) => embedder = Some(e),
+                Err(e) => {
+                    tracing::error!(error = ?e, "Failed to load embedding model");
+                    continue;
+                }
+            }
+        }
+
+        // Inference is CPU-bound and would otherwise stall the Jetstream
+        // reader on this single-threaded runtime, so it runs on the blocking
+        // pool. The embedder is moved in and handed back out again.
+        let count = pending.len();
+        let owned = embedder.take().expect("embedder loaded above");
+        let result = tokio::task::spawn_blocking(move || {
+            let mut owned = owned;
+            let mut out = Vec::with_capacity(pending.len());
+            for (id, text) in &pending {
+                match owned.encode(text) {
+                    Ok(vector) => out.push((*id, vector)),
+                    Err(e) => tracing::error!(error = ?e, id, "Failed to embed post"),
+                }
+            }
+            (owned, out)
+        })
+        .await;
+
+        let (returned, vectors) = match result {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(error = ?e, "Embedding task panicked");
+                continue;
+            }
+        };
+        embedder = Some(returned);
+
+        if !vectors.is_empty() {
+            let mut db = db.lock().await;
+            match db.store_embeddings(&vectors) {
+                Ok(()) => tracing::info!("Generated embeddings for {} posts", vectors.len()),
+                Err(e) => tracing::error!(error = ?e, "Failed to store embeddings"),
+            }
+        }
+
+        // Start the idle clock only once the backlog is drained.
+        idle_since = if count < EMBEDDING_BATCH_SIZE {
+            Some(Instant::now())
+        } else {
+            None
+        };
+    }
     Ok(())
 }
 
