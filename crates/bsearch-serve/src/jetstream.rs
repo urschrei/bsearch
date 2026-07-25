@@ -204,3 +204,198 @@ pub async fn run(
 }
 
 const RECONNECT_DELAY_SECS: u64 = 5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atproto_jetstream::JetstreamEventCommit;
+    use tempfile::NamedTempFile;
+
+    const DID: &str = "did:plc:aefyqfi5jdig6vjfa73debzc";
+
+    fn commit_event(
+        collection: &str,
+        operation: &str,
+        record: serde_json::Value,
+    ) -> JetstreamEvent {
+        JetstreamEvent::Commit {
+            did: DID.to_string(),
+            time_us: 1_785_009_595_019_071,
+            kind: "commit".to_string(),
+            commit: JetstreamEventCommit {
+                rev: "3mrir7qvgmk2o".to_string(),
+                operation: operation.to_string(),
+                collection: collection.to_string(),
+                rkey: "3lxyz123".to_string(),
+                cid: "bafyreiabc123".to_string(),
+                record,
+            },
+        }
+    }
+
+    /// The handler under test plus the shared state it writes through. The
+    /// temp file is held so the database outlives the test.
+    struct Harness {
+        _file: NamedTempFile,
+        handler: IngestHandler,
+        db: Arc<Mutex<Database>>,
+        queue: Arc<Mutex<VecDeque<String>>>,
+    }
+
+    fn harness() -> Harness {
+        let file = NamedTempFile::new().expect("temp file");
+        let db = Database::open_read_write(file.path()).expect("open db");
+        let db = Arc::new(Mutex::new(db));
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let handler =
+            IngestHandler::new(db.clone(), queue.clone(), "alice.bsky.social".to_string());
+        Harness {
+            _file: file,
+            handler,
+            db,
+            queue,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_own_post_is_indexed_with_python_compatible_fields() {
+        let h = harness();
+        let (handler, db) = (&h.handler, &h.db);
+        let event = commit_event(
+            COLLECTION_POST,
+            "create",
+            serde_json::json!({"text": "a post about ferrets", "createdAt": "2026-07-25T21:01:36.005Z"}),
+        );
+
+        handler
+            .handle_event(Arc::new(event))
+            .await
+            .expect("handle failed");
+
+        let db = db.lock().await;
+        let results = db
+            .search_fts("ferrets", 10, None, None)
+            .expect("search failed");
+        assert_eq!(
+            results.len(),
+            1,
+            "post should be indexed and FTS-searchable"
+        );
+        let row = &results[0];
+        assert_eq!(row.uri, format!("at://{DID}/{COLLECTION_POST}/3lxyz123"));
+        assert_eq!(row.source, "own_post");
+        assert_eq!(row.author_handle, "alice.bsky.social");
+        assert_eq!(row.author_did, DID);
+        assert_eq!(row.cid, "bafyreiabc123");
+        // Exactly what Python's datetime.isoformat() would have written.
+        assert_eq!(row.created_at, "2026-07-25T21:01:36.005000+00:00");
+        // Naive local time, so no offset.
+        assert!(
+            !row.indexed_at.contains('+'),
+            "indexed_at should be naive: {}",
+            row.indexed_at
+        );
+
+        assert_eq!(
+            db.get_cursor().expect("cursor"),
+            Some(1_785_009_595_019_071)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_like_is_queued_not_indexed() {
+        let h = harness();
+        let (handler, db, queue) = (&h.handler, &h.db, &h.queue);
+        let liked = "at://did:plc:other/app.bsky.feed.post/abc";
+        let event = commit_event(
+            COLLECTION_LIKE,
+            "create",
+            serde_json::json!({"subject": {"uri": liked, "cid": "bafy"}}),
+        );
+
+        handler
+            .handle_event(Arc::new(event))
+            .await
+            .expect("handle failed");
+
+        assert_eq!(queue.lock().await.iter().collect::<Vec<_>>(), vec![liked]);
+        let db = db.lock().await;
+        assert!(
+            db.get_posts_without_embeddings(10)
+                .expect("query")
+                .is_empty(),
+            "the like itself must not be indexed; only the post it points at"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_create_operations_are_ignored() {
+        let h = harness();
+        let (handler, db) = (&h.handler, &h.db);
+        let event = commit_event(
+            COLLECTION_POST,
+            "delete",
+            serde_json::json!({"text": "should not be indexed"}),
+        );
+
+        handler
+            .handle_event(Arc::new(event))
+            .await
+            .expect("handle failed");
+
+        let db = db.lock().await;
+        assert!(db
+            .get_posts_without_embeddings(10)
+            .expect("query")
+            .is_empty());
+        assert_eq!(
+            db.get_cursor().expect("cursor"),
+            None,
+            "an ignored event must not advance the cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_without_text_is_skipped() {
+        let h = harness();
+        let (handler, db) = (&h.handler, &h.db);
+        let event = commit_event(
+            COLLECTION_POST,
+            "create",
+            serde_json::json!({"createdAt": "2026-07-25T21:01:36.005Z"}),
+        );
+
+        handler
+            .handle_event(Arc::new(event))
+            .await
+            .expect("handle failed");
+
+        let db = db.lock().await;
+        assert!(db
+            .get_posts_without_embeddings(10)
+            .expect("query")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_replayed_event_does_not_duplicate() {
+        let h = harness();
+        let (handler, db) = (&h.handler, &h.db);
+        let event = Arc::new(commit_event(
+            COLLECTION_POST,
+            "create",
+            serde_json::json!({"text": "replayed post", "createdAt": "2026-07-25T21:01:36.005Z"}),
+        ));
+
+        // Reconnecting rewinds the cursor, so the same event arrives twice.
+        handler.handle_event(event.clone()).await.expect("first");
+        handler.handle_event(event).await.expect("second");
+
+        let db = db.lock().await;
+        assert_eq!(
+            db.get_posts_without_embeddings(10).expect("query").len(),
+            1,
+            "the UNIQUE uri constraint should absorb the replay"
+        );
+    }
+}
