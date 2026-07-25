@@ -17,6 +17,8 @@ wheels/
 *.db-wal
 *.db-shm
 *.db.backup
+*.db.backup-wal
+*.db.backup-shm
 
 # Rust
 /target/

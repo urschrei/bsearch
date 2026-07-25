@@ -13,11 +13,20 @@ A local tool that monitors a Bluesky account via [Jetstream](https://github.com/
 - Python remains for one-off commands: setup, backfill, model export and maintenance
 
 The daemon is written in Rust because it is long-lived. The equivalent Python
-service held around 2.5 GB resident, most of it PyTorch and the Metal/MPS
-allocations `sentence-transformers` makes on Apple Silicon, to embed a handful
-of short posts every ten seconds. The Rust daemon idles at roughly 20 MB,
-loading the ONNX session only when there are posts to embed and dropping it
-again after five minutes idle.
+service settled at a 2.5 GB physical footprint -- mostly PyTorch plus the
+Metal/MPS allocations `sentence-transformers` makes on Apple Silicon -- to
+embed a handful of short posts every ten seconds. Measured footprints on the
+same machine and model:
+
+| | Physical footprint |
+|---|---|
+| Python daemon (steady state, MPS) | 2586 MB |
+| Rust daemon, idle | 9-19 MB |
+| Rust daemon, embedding a batch | ~70 MB |
+
+The ONNX session is loaded only when there are posts to embed and dropped
+again after five minutes idle, which is what keeps the idle figure low;
+reloading takes well under a second.
 
 ## Setup
 
