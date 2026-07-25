@@ -9,7 +9,10 @@ edition = "2021"
 [workspace.dependencies]
 anyhow = "1"
 ndarray = "0.17"
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+# Default features include `download-binaries`, which fetches a prebuilt
+# ONNX Runtime at build time and links it statically. This keeps the binaries
+# self-contained: no ORT_DYLIB_PATH, no Homebrew libonnxruntime at runtime.
+ort = "2.0.0-rc.12"
 rusqlite = { version = "0.34", features = ["bundled", "load_extension"] }
 sqlite-vec = "0.1"
 tokenizers = "0.21"
