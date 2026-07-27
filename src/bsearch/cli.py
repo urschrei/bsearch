@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from datetime import UTC
 
 import click
 
@@ -150,9 +151,9 @@ def status():
             click.echo(f"  {source_name}: {count}")
 
     if stats["cursor"] is not None:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        cursor_dt = datetime.fromtimestamp(stats["cursor"] / 1_000_000, tz=timezone.utc)
+        cursor_dt = datetime.fromtimestamp(stats["cursor"] / 1_000_000, tz=UTC)
         click.echo(f"Cursor:      {stats['cursor']} ({cursor_dt.isoformat()})")
     else:
         click.echo("Cursor:      not set")

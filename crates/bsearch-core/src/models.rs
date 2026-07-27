@@ -2,6 +2,8 @@ use chrono::DateTime;
 use chrono::FixedOffset;
 use chrono::Local;
 use chrono::NaiveDateTime;
+use chrono::TimeZone;
+use chrono::Utc;
 
 /// Where a post came from. Serialised into `posts.source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +105,31 @@ pub fn parse_created_at(raw: Option<&str>) -> String {
     }
 }
 
+/// Parse a stored `created_at` value back into an instant, for ordering.
+///
+/// The stored text is not in one fixed form. [`format_created_at`] preserves
+/// whatever offset the source record carried, emits the fractional part only
+/// when it is non-zero, and [`parse_created_at`] falls back to a naive local
+/// timestamp when the record's value is missing or malformed. Comparing these
+/// as strings therefore does not always give chronological order, so callers
+/// that need to sort by date go through here.
+///
+/// Naive values are read as local time, which is what wrote them. Returns
+/// `None` if neither form parses, leaving it to the caller to decide where
+/// such a row belongs.
+pub fn created_at_sort_key(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let naive = NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+    // Ambiguous local times (the repeated hour when clocks go back) resolve to
+    // the earlier instant; either choice is arbitrary and this one is total.
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +188,47 @@ mod tests {
         assert!(!out.contains('+'), "fallback should be naive: {out}");
         let out = parse_created_at(None);
         assert!(!out.contains('+'), "fallback should be naive: {out}");
+    }
+
+    #[test]
+    fn test_created_at_sort_key_orders_across_offsets() {
+        // The whole point of parsing rather than comparing strings: this pair
+        // sorts the wrong way round lexicographically, because the earlier
+        // instant has the later wall-clock reading.
+        let earlier = created_at_sort_key("2026-03-29T10:00:00+05:00").unwrap();
+        let later = created_at_sort_key("2026-03-29T09:00:00+00:00").unwrap();
+        assert!(earlier < later);
+        assert!("2026-03-29T10:00:00+05:00" > "2026-03-29T09:00:00+00:00");
+    }
+
+    #[test]
+    fn test_created_at_sort_key_handles_absent_fractional_part() {
+        let without = created_at_sort_key("2026-03-29T03:11:00+00:00").unwrap();
+        let with = created_at_sort_key("2026-03-29T03:11:00.467000+00:00").unwrap();
+        assert!(without < with);
+    }
+
+    #[test]
+    fn test_created_at_sort_key_accepts_naive_fallback() {
+        // What parse_created_at writes when a record's timestamp is unusable.
+        let naive = format_indexed_at(Local::now().naive_local());
+        assert!(
+            created_at_sort_key(&naive).is_some(),
+            "naive fallback timestamps must still be sortable: {naive}"
+        );
+    }
+
+    #[test]
+    fn test_created_at_sort_key_rejects_garbage() {
+        assert_eq!(created_at_sort_key("not a date"), None);
+        assert_eq!(created_at_sort_key(""), None);
+    }
+
+    #[test]
+    fn test_created_at_sort_key_round_trips_format_created_at() {
+        let dt = DateTime::parse_from_rfc3339("2026-03-29T03:11:21.467123+01:00").unwrap();
+        let key = created_at_sort_key(&format_created_at(dt)).unwrap();
+        assert_eq!(key, dt.with_timezone(&Utc));
     }
 
     #[test]
