@@ -93,39 +93,46 @@ impl IngestHandler {
     }
 }
 
+/// The stream position of any event, whatever its kind.
+fn event_time_us(event: &JetstreamEvent) -> u64 {
+    match event {
+        JetstreamEvent::Commit { time_us, .. }
+        | JetstreamEvent::Delete { time_us, .. }
+        | JetstreamEvent::Identity { time_us, .. }
+        | JetstreamEvent::Account { time_us, .. } => *time_us,
+    }
+}
+
 #[async_trait]
 impl EventHandler for IngestHandler {
     async fn handle_event(&self, event: Arc<JetstreamEvent>) -> Result<()> {
-        // Deletes, identity and account events are all ignored, matching the
-        // `operation != "create"` filter in the Python client.
-        let JetstreamEvent::Commit {
-            did,
-            time_us,
-            commit,
-            ..
-        } = event.as_ref()
-        else {
-            return Ok(());
-        };
+        let time_us = event_time_us(event.as_ref());
 
-        if commit.operation != "create" {
-            return Ok(());
-        }
-
-        match commit.collection.as_str() {
-            COLLECTION_POST => {
-                self.handle_own_post(did, &commit.rkey, &commit.cid, &commit.record)
-                    .await?
+        // Deletes, identity and account events are not indexed, matching the
+        // `operation != "create"` filter in the Python client -- but they do
+        // still move the cursor, below.
+        if let JetstreamEvent::Commit { did, commit, .. } = event.as_ref() {
+            if commit.operation == "create" {
+                match commit.collection.as_str() {
+                    COLLECTION_POST => {
+                        self.handle_own_post(did, &commit.rkey, &commit.cid, &commit.record)
+                            .await?
+                    }
+                    COLLECTION_LIKE => self.handle_like(&commit.record).await,
+                    _ => {}
+                }
             }
-            COLLECTION_LIKE => self.handle_like(&commit.record).await,
-            _ => return Ok(()),
         }
 
-        // Advance the cursor only after the event has been handled, so a crash
+        // Advance the cursor for every event delivered, not only the ones that
+        // produced a row. The cursor records how far through the stream we
+        // have read, and an event we deliberately ignored has still been read;
+        // leaving it parked means every reconnect asks to replay from further
+        // and further back. Reached only after handling succeeded, so a crash
         // mid-handling replays the event rather than skipping it.
         {
             let db = self.db.lock().await;
-            db.set_cursor(*time_us as i64)?;
+            db.set_cursor(time_us as i64)?;
         }
         Ok(())
     }
@@ -133,6 +140,50 @@ impl EventHandler for IngestHandler {
     fn handler_id(&self) -> &str {
         &self.id
     }
+}
+
+/// What to ask Jetstream for on connecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorPlan {
+    /// No stored position: take the stream from wherever it is now.
+    LiveTail,
+    /// Resume from a stored position still inside the replay window.
+    Resume(i64),
+    /// The stored position has aged out of the replay window. `requested` is
+    /// what we would have asked for, `oldest` the earliest we can still get;
+    /// events between the two are gone and need a backfill.
+    Truncated { requested: i64, oldest: i64 },
+}
+
+/// Decide what to ask for, given the stored cursor and how far back Jetstream
+/// will replay.
+///
+/// Jetstream retains a rolling window of roughly 72 hours. A cursor older than
+/// that is *not* rejected: playback silently begins at the oldest event still
+/// held, so from here a truncated replay is indistinguishable from a complete
+/// one. Working out the truncation ourselves is the only way to know a gap
+/// exists, and the only way to say so.
+fn plan_cursor(stored: Option<i64>, now_us: i64, max_age_us: i64) -> CursorPlan {
+    let Some(stored) = stored else {
+        return CursorPlan::LiveTail;
+    };
+    let oldest = now_us - max_age_us;
+    if stored < oldest {
+        CursorPlan::Truncated {
+            requested: stored,
+            oldest,
+        }
+    } else {
+        CursorPlan::Resume(stored)
+    }
+}
+
+/// Wall-clock microseconds since the epoch, the same units as `time_us`.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// Cancel `connection_token` once `lifetime` has elapsed.
@@ -171,11 +222,33 @@ pub async fn run(
     token: CancellationToken,
 ) -> Result<()> {
     while !token.is_cancelled() {
-        let cursor = {
+        let stored = {
             let db = db.lock().await;
             db.get_cursor()?
         }
         .map(|c| c - config.reconnect_cursor_safety_seconds * 1_000_000);
+
+        let cursor = match plan_cursor(
+            stored,
+            now_micros(),
+            config.max_cursor_age_seconds as i64 * 1_000_000,
+        ) {
+            CursorPlan::LiveTail => None,
+            CursorPlan::Resume(c) => Some(c),
+            CursorPlan::Truncated { requested, oldest } => {
+                let gap_hours = (oldest - requested) as f64 / 3_600_000_000.0;
+                tracing::warn!(
+                    gap_hours = format!("{gap_hours:.1}"),
+                    "Stored cursor is older than Jetstream's replay window; \
+                     events in the gap need `bsearch backfill`"
+                );
+                notify(
+                    "bsearch: gap in history",
+                    "Offline longer than Jetstream retains. Run `bsearch backfill`.",
+                );
+                Some(oldest)
+            }
+        };
 
         let task_config = ConsumerTaskConfig {
             user_agent: concat!("bsearch/", env!("CARGO_PKG_VERSION")).to_string(),
@@ -256,6 +329,112 @@ mod tests {
     use tempfile::NamedTempFile;
 
     const DID: &str = "did:plc:aefyqfi5jdig6vjfa73debzc";
+
+    const HOUR_US: i64 = 3_600_000_000;
+    const WINDOW_US: i64 = 72 * HOUR_US;
+
+    #[test]
+    fn test_plan_cursor_without_stored_position_live_tails() {
+        assert_eq!(
+            plan_cursor(None, 1_000 * HOUR_US, WINDOW_US),
+            CursorPlan::LiveTail
+        );
+    }
+
+    #[test]
+    fn test_plan_cursor_resumes_inside_the_window() {
+        let now = 1_000 * HOUR_US;
+        let stored = now - HOUR_US;
+        assert_eq!(
+            plan_cursor(Some(stored), now, WINDOW_US),
+            CursorPlan::Resume(stored)
+        );
+    }
+
+    #[test]
+    fn test_plan_cursor_reports_truncation_beyond_the_window() {
+        // Jetstream would accept this cursor and quietly start playback at its
+        // oldest retained event, so the gap has to be worked out here.
+        let now = 1_000 * HOUR_US;
+        let stored = now - 100 * HOUR_US;
+        assert_eq!(
+            plan_cursor(Some(stored), now, WINDOW_US),
+            CursorPlan::Truncated {
+                requested: stored,
+                oldest: now - WINDOW_US,
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_cursor_window_edge_still_resumes() {
+        let now = 1_000 * HOUR_US;
+        let stored = now - WINDOW_US;
+        assert_eq!(
+            plan_cursor(Some(stored), now, WINDOW_US),
+            CursorPlan::Resume(stored),
+            "a cursor exactly at the edge is still replayable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ignored_event_still_advances_cursor() {
+        // The bug this guards: an account whose only activity is outside the
+        // indexed collections would leave the cursor parked, so every
+        // reconnect replayed from further and further back.
+        let h = harness();
+
+        let event = commit_event(
+            "app.bsky.graph.follow",
+            "create",
+            serde_json::json!({"subject": "did:plc:someone"}),
+        );
+        let expected = event_time_us(&event) as i64;
+
+        h.handler
+            .handle_event(Arc::new(event))
+            .await
+            .expect("handle failed");
+
+        let db = h.db.lock().await;
+        assert_eq!(db.get_cursor().expect("read failed"), Some(expected));
+        assert_eq!(
+            db.search_fts("", 10, None, None, Order::Relevance)
+                .expect("search failed")
+                .len(),
+            0,
+            "the event should move the cursor without being indexed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_event_advances_cursor() {
+        let h = harness();
+
+        let event = JetstreamEvent::Delete {
+            did: DID.to_string(),
+            time_us: 1_785_000_000_000_000,
+            kind: "commit".to_string(),
+            commit: serde_json::from_value(serde_json::json!({
+                "rev": "abc",
+                "operation": "delete",
+                "collection": COLLECTION_POST,
+                "rkey": "gone",
+            }))
+            .expect("delete payload"),
+        };
+
+        h.handler
+            .handle_event(Arc::new(event))
+            .await
+            .expect("handle failed");
+
+        let db = h.db.lock().await;
+        assert_eq!(
+            db.get_cursor().expect("read failed"),
+            Some(1_785_000_000_000_000)
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn test_watchdog_ends_connection_but_not_service() {
@@ -448,10 +627,13 @@ mod tests {
             .get_posts_without_embeddings(10)
             .expect("query")
             .is_empty());
+        // Ignored, but read: the cursor records progress through the stream,
+        // not rows written. Holding it back here was what left an account with
+        // no indexable activity replaying from ever further back.
         assert_eq!(
             db.get_cursor().expect("cursor"),
-            None,
-            "an ignored event must not advance the cursor"
+            Some(1_785_009_595_019_071),
+            "an ignored event has still been read, so the cursor must advance"
         );
     }
 

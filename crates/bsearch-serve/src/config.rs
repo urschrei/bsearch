@@ -32,6 +32,14 @@ pub struct Config {
     /// cursor rewinds a few seconds and inserts are `INSERT OR IGNORE` against
     /// a UNIQUE URI -- so the cost of doing this needlessly is close to nil.
     pub max_connection_seconds: u64,
+    /// How far back Jetstream will replay, and so the oldest cursor worth
+    /// asking for.
+    ///
+    /// A cursor older than the server's window is not refused; playback just
+    /// starts at the oldest event still retained, which makes a gap in our
+    /// history look exactly like an uneventful period. Knowing the window lets
+    /// the daemon spot that case and say so.
+    pub max_cursor_age_seconds: u64,
     /// How long the embedding loop may sit idle before the ONNX session is
     /// dropped. Reloading costs well under a second, and holding the session
     /// open is the difference between roughly 20 MB and 90 MB resident.
@@ -91,6 +99,8 @@ impl Config {
             // The server was observed closing idle connections roughly every
             // seven minutes anyway, so recycling at five keeps us ahead of it.
             max_connection_seconds: 300,
+            // Jetstream's documented backfill window is roughly 72 hours.
+            max_cursor_age_seconds: 72 * 3600,
             embedder_idle_timeout: 300,
         })
     }
