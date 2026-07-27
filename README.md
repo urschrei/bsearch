@@ -163,6 +163,27 @@ keys as the Python CLI. `BSEARCH_DB_PATH` and `BSEARCH_MODEL_DIR` override the
 database and model locations, and `RUST_LOG` controls logging (default
 `info,ort=warn`).
 
+The daemon remakes its Jetstream connection every five minutes, so the log
+shows a reconnect on that cadence even when nothing is wrong. This is
+deliberate: a WebSocket that dies without a close frame leaves the underlying
+consumer waiting on a read that never returns, and because the subscription is
+filtered to a single DID, no traffic is expected anyway -- so a stalled
+connection is otherwise indistinguishable from an idle account. Capping the
+lifetime bounds how long ingestion can stall. Reconnecting rewinds the cursor a
+few seconds and post inserts ignore duplicate URIs, so replayed events are
+harmless.
+
+On reconnect the daemon resumes from the stored cursor. Jetstream replays about
+72 hours; a cursor older than that is not refused, but playback quietly starts
+at the oldest event still held, which would leave a gap in the database with
+nothing to show for it. The daemon compares the cursor against that window
+itself and warns that `bsearch backfill` is needed, since the missing events
+cannot come from the stream.
+
+Stop the daemon before running `bsearch backfill`. Both generate embeddings for
+posts with `has_embedding = 0`, and run together they collide on `vec_posts`,
+failing whichever writes second.
+
 ## Service logs
 
 When running as a launchd agent, logs are written to:
