@@ -163,15 +163,25 @@ keys as the Python CLI. `BSEARCH_DB_PATH` and `BSEARCH_MODEL_DIR` override the
 database and model locations, and `RUST_LOG` controls logging (default
 `info,ort=warn`).
 
-The daemon remakes its Jetstream connection every five minutes, so the log
-shows a reconnect on that cadence even when nothing is wrong. This is
-deliberate: a WebSocket that dies without a close frame leaves the underlying
-consumer waiting on a read that never returns, and because the subscription is
-filtered to a single DID, no traffic is expected anyway -- so a stalled
-connection is otherwise indistinguishable from an idle account. Capping the
-lifetime bounds how long ingestion can stall. Reconnecting rewinds the cursor a
-few seconds and post inserts ignore duplicate URIs, so replayed events are
-harmless.
+The daemon remakes its Jetstream connection periodically, so the log shows
+reconnects even when nothing is wrong. This is deliberate: a WebSocket that
+dies without a close frame leaves the underlying consumer waiting on a read
+that never returns, and because the subscription is filtered to a single DID,
+no traffic is expected anyway -- so a stalled connection is otherwise
+indistinguishable from an idle account. Capping the lifetime bounds how long
+ingestion can stall. Reconnecting rewinds the cursor a few seconds and post
+inserts ignore duplicate URIs, so replayed events are harmless.
+
+The interval is not fixed, because resuming from an old cursor makes Jetstream
+scan its buffer forward, and that scan is silent until it reaches an event. A
+connection is therefore allowed roughly `(now - cursor) / 50` seconds, never
+less than `max_connection_seconds`: caught up, it recycles on the base
+interval and a dead socket is noticed quickly; far behind, it gets the time the
+scan needs. Measured replay is around 150 times realtime -- crossing a
+13.5-hour stretch containing no events for the account took 323 seconds -- so
+a fixed deadline shorter than that would end every attempt just before the
+first event arrived, leaving the cursor unmoved and the next attempt repeating
+the same scan indefinitely.
 
 On reconnect the daemon resumes from the stored cursor. Jetstream replays about
 72 hours; a cursor older than that is not refused, but playback quietly starts
