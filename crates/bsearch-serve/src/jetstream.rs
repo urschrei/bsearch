@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -186,6 +187,34 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
+/// How much faster than realtime Jetstream replays its buffer, assumed
+/// conservatively.
+///
+/// Measured at roughly 150x: replaying a 13.5-hour stretch containing no
+/// events for this DID delivered the next event after 323 seconds. The figure
+/// used here is a third of that, so a server slower than the one measured
+/// still finishes inside the deadline.
+const ASSUMED_REPLAY_SPEEDUP: i64 = 50;
+
+/// How long to let one connection live, given how far back it has to replay.
+///
+/// A connection scanning a stretch of buffer that holds no events for this DID
+/// is silent, and so is one whose socket has died. Nothing distinguishes them
+/// except time: the scan needs about `(now - cursor) / ASSUMED_REPLAY_SPEEDUP`
+/// to reach the present. Cutting it off earlier ends a replay that was going
+/// to succeed, and since the next attempt restarts from the same unadvanced
+/// cursor, it is cut off at the same point forever -- a livelock rather than a
+/// retry. Once caught up this falls back to `base`, because a cursor near the
+/// present implies no scanning and a stalled socket should be caught quickly.
+fn connection_lifetime(cursor: Option<i64>, now_us: i64, base: Duration) -> Duration {
+    let Some(cursor) = cursor else {
+        return base;
+    };
+    let lag_us = (now_us - cursor).max(0);
+    let scan = Duration::from_secs((lag_us / ASSUMED_REPLAY_SPEEDUP / 1_000_000) as u64);
+    scan.max(base)
+}
+
 /// Cancel `connection_token` once `lifetime` has elapsed.
 ///
 /// The caller aborts the returned handle when the connection ends for any
@@ -274,10 +303,12 @@ pub async fn run(
         // A child token so the watchdog can end this connection without
         // stopping the service; cancelling the parent still cancels the child.
         let connection_token = token.child_token();
-        let watchdog = spawn_connection_watchdog(
-            connection_token.clone(),
-            std::time::Duration::from_secs(config.max_connection_seconds),
+        let lifetime = connection_lifetime(
+            cursor,
+            now_micros(),
+            Duration::from_secs(config.max_connection_seconds),
         );
+        let watchdog = spawn_connection_watchdog(connection_token.clone(), lifetime);
 
         let outcome = consumer.run_background(connection_token.clone()).await;
         // Whether the connection ended on its own or on the timer, the
@@ -291,7 +322,7 @@ pub async fn run(
             // logged quietly and does not raise a notification.
             Ok(()) if connection_token.is_cancelled() => {
                 tracing::debug!(
-                    seconds = config.max_connection_seconds,
+                    seconds = lifetime.as_secs(),
                     "Recycling Jetstream connection"
                 );
             }
@@ -375,6 +406,63 @@ mod tests {
             CursorPlan::Resume(stored),
             "a cursor exactly at the edge is still replayable"
         );
+    }
+
+    const BASE: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn test_connection_lifetime_is_base_when_caught_up() {
+        let now = 1_000 * HOUR_US;
+        assert_eq!(connection_lifetime(Some(now), now, BASE), BASE);
+        assert_eq!(connection_lifetime(None, now, BASE), BASE);
+    }
+
+    #[test]
+    fn test_connection_lifetime_covers_the_measured_stall() {
+        // The regression this exists to prevent. Replaying from a cursor 15.5
+        // hours back needed 323s before the first event arrived; a flat 300s
+        // deadline cut every attempt off just short, and because the cursor
+        // never advanced, every retry restarted the same scan and died at the
+        // same point.
+        let now = 1_000 * HOUR_US;
+        let cursor = now - (155 * HOUR_US / 10);
+        let lifetime = connection_lifetime(Some(cursor), now, BASE);
+        assert!(
+            lifetime > Duration::from_secs(323),
+            "must outlast the measured traversal, got {lifetime:?}"
+        );
+    }
+
+    #[test]
+    fn test_connection_lifetime_scales_with_lag() {
+        let now = 1_000 * HOUR_US;
+        let short = connection_lifetime(Some(now - 10 * HOUR_US), now, BASE);
+        let long = connection_lifetime(Some(now - 70 * HOUR_US), now, BASE);
+        assert!(
+            long > short,
+            "further back must get longer, {long:?} vs {short:?}"
+        );
+    }
+
+    #[test]
+    fn test_connection_lifetime_spans_the_whole_replay_window() {
+        // Worst case: a cursor at the far edge of what Jetstream retains still
+        // has to be reachable in a single connection, or it can never catch up.
+        let now = 1_000 * HOUR_US;
+        let lifetime = connection_lifetime(Some(now - 72 * HOUR_US), now, BASE);
+        let at_measured_rate = Duration::from_secs(72 * 3600 / 150);
+        assert!(
+            lifetime > at_measured_rate,
+            "must cover a full-window scan, got {lifetime:?}"
+        );
+    }
+
+    #[test]
+    fn test_connection_lifetime_tolerates_cursor_ahead_of_now() {
+        // Clock skew, or a cursor written from a Jetstream timestamp that runs
+        // slightly ahead of local time: must not underflow into a huge value.
+        let now = 1_000 * HOUR_US;
+        assert_eq!(connection_lifetime(Some(now + HOUR_US), now, BASE), BASE);
     }
 
     #[tokio::test]
