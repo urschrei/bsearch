@@ -21,6 +21,17 @@ pub struct Config {
     pub like_batch_interval: u64,
     pub embedding_batch_interval: u64,
     pub reconnect_cursor_safety_seconds: i64,
+    /// How long a single Jetstream connection may live before it is torn down
+    /// and remade.
+    ///
+    /// Nothing below us notices a connection that dies without a close frame:
+    /// the consumer loop parks on a read that will never complete, and because
+    /// the subscription is filtered to one DID, silence is indistinguishable
+    /// from an idle account. Recycling on a timer bounds how long ingestion can
+    /// stall to this interval. Reconnecting is cheap and replay-safe -- the
+    /// cursor rewinds a few seconds and inserts are `INSERT OR IGNORE` against
+    /// a UNIQUE URI -- so the cost of doing this needlessly is close to nil.
+    pub max_connection_seconds: u64,
     /// How long the embedding loop may sit idle before the ONNX session is
     /// dropped. Reloading costs well under a second, and holding the session
     /// open is the difference between roughly 20 MB and 90 MB resident.
@@ -77,6 +88,9 @@ impl Config {
             like_batch_interval: 2,
             embedding_batch_interval: 10,
             reconnect_cursor_safety_seconds: 5,
+            // The server was observed closing idle connections roughly every
+            // seven minutes anyway, so recycling at five keeps us ahead of it.
+            max_connection_seconds: 300,
             embedder_idle_timeout: 300,
         })
     }

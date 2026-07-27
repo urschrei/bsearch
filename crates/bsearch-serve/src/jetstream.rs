@@ -135,6 +135,20 @@ impl EventHandler for IngestHandler {
     }
 }
 
+/// Cancel `connection_token` once `lifetime` has elapsed.
+///
+/// The caller aborts the returned handle when the connection ends for any
+/// other reason, so in the common case this timer never fires.
+fn spawn_connection_watchdog(
+    connection_token: CancellationToken,
+    lifetime: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(lifetime).await;
+        connection_token.cancel();
+    })
+}
+
 /// Run the Jetstream consumer, reconnecting until cancelled.
 ///
 /// `Consumer::run_background` returns when the socket closes rather than
@@ -143,6 +157,13 @@ impl EventHandler for IngestHandler {
 /// `reconnect_cursor_safety_seconds`, as `JetstreamClient.run` does in Python;
 /// replayed events are harmless because `posts.uri` is UNIQUE and inserts use
 /// INSERT OR IGNORE.
+///
+/// Each connection is also given a bounded lifetime, because a socket that
+/// dies without a close frame leaves the consumer parked on a read that never
+/// completes. Nothing below this function detects that: the underlying loop
+/// breaks only on a clean close, and a subscription filtered to one DID is
+/// silent whenever the account is idle, so there is no traffic whose absence
+/// would give the fault away. See `Config::max_connection_seconds`.
 pub async fn run(
     config: &Config,
     db: Arc<Mutex<Database>>,
@@ -177,8 +198,30 @@ pub async fn run(
 
         tracing::info!(cursor = ?cursor, host = %config.jetstream_hostname, "Connecting to Jetstream");
 
-        match consumer.run_background(token.clone()).await {
+        // A child token so the watchdog can end this connection without
+        // stopping the service; cancelling the parent still cancels the child.
+        let connection_token = token.child_token();
+        let watchdog = spawn_connection_watchdog(
+            connection_token.clone(),
+            std::time::Duration::from_secs(config.max_connection_seconds),
+        );
+
+        let outcome = consumer.run_background(connection_token.clone()).await;
+        // Whether the connection ended on its own or on the timer, the
+        // watchdog has no further work; leaving it running would cancel a
+        // token nothing is listening to.
+        watchdog.abort();
+
+        match outcome {
             Ok(()) if token.is_cancelled() => break,
+            // The watchdog fired: this is the recycle, not a fault, so it is
+            // logged quietly and does not raise a notification.
+            Ok(()) if connection_token.is_cancelled() => {
+                tracing::debug!(
+                    seconds = config.max_connection_seconds,
+                    "Recycling Jetstream connection"
+                );
+            }
             Ok(()) => {
                 tracing::warn!("Jetstream connection closed");
                 notify("bsearch: disconnected", "Jetstream connection closed.");
@@ -213,6 +256,62 @@ mod tests {
     use tempfile::NamedTempFile;
 
     const DID: &str = "did:plc:aefyqfi5jdig6vjfa73debzc";
+
+    #[tokio::test(start_paused = true)]
+    async fn test_watchdog_ends_connection_but_not_service() {
+        let service = CancellationToken::new();
+        let connection = service.child_token();
+
+        let handle =
+            spawn_connection_watchdog(connection.clone(), std::time::Duration::from_secs(300));
+
+        tokio::time::advance(std::time::Duration::from_secs(299)).await;
+        assert!(
+            !connection.is_cancelled(),
+            "should still be within lifetime"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        handle.await.expect("watchdog panicked");
+
+        assert!(
+            connection.is_cancelled(),
+            "a connection that outlives its lifetime must be torn down"
+        );
+        assert!(
+            !service.is_cancelled(),
+            "recycling one connection must not stop the service"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_aborted_watchdog_leaves_connection_alone() {
+        // The usual case: the connection ends by itself and the caller aborts
+        // the timer. Nothing should cancel the token afterwards.
+        let service = CancellationToken::new();
+        let connection = service.child_token();
+
+        let handle =
+            spawn_connection_watchdog(connection.clone(), std::time::Duration::from_secs(300));
+        handle.abort();
+
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        assert!(!connection.is_cancelled());
+        assert!(!service.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelling_service_cancels_live_connection() {
+        // Shutdown must propagate through the child token, or the consumer
+        // would keep running after the service was told to stop.
+        let service = CancellationToken::new();
+        let connection = service.child_token();
+        let _watchdog =
+            spawn_connection_watchdog(connection.clone(), std::time::Duration::from_secs(300));
+
+        service.cancel();
+        assert!(connection.is_cancelled());
+    }
 
     fn commit_event(
         collection: &str,

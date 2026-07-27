@@ -19,3 +19,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` gives the tests a paused clock, so the connection-lifetime
+# watchdog can be exercised without waiting out its real timeout.
+tokio = { version = "1.53.1", features = ["test-util"] }
