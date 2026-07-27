@@ -404,9 +404,18 @@ impl Database {
             })
         })?;
 
-        results
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut results = results.collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if order == Order::DateDesc {
+            // SQLite compared the timestamps as text to pick these rows, which
+            // parts company with chronological order for the stored forms that
+            // differ in offset or precision. Re-sorting properly fixes the order
+            // of what came back; the selection can still be off by a row at the
+            // limit boundary if such timestamps straddle it.
+            sort_by_created_at_desc(&mut results);
+        }
+
+        Ok(results)
     }
 
     pub fn search_vec(
@@ -759,13 +768,29 @@ mod tests {
     }
 
     fn insert_post(path: &Path, uri: &str, text: &str, source: &str, handle: &str) {
+        insert_post_at(path, uri, text, source, handle, "2024-01-01T00:00:00Z");
+    }
+
+    fn insert_post_at(
+        path: &Path,
+        uri: &str,
+        text: &str,
+        source: &str,
+        handle: &str,
+        created_at: &str,
+    ) {
         let conn = Connection::open(path).expect("failed to open db");
         conn.execute(
             "INSERT INTO posts (uri, cid, author_did, author_handle, text, created_at, source, indexed_at)
-             VALUES (?1, '', '', ?2, ?3, '2024-01-01T00:00:00Z', ?4, '2024-01-01T00:00:00Z')",
-            rusqlite::params![uri, handle, text, source],
+             VALUES (?1, '', '', ?2, ?3, ?5, ?4, '2024-01-01T00:00:00Z')",
+            rusqlite::params![uri, handle, text, source, created_at],
         )
         .expect("failed to insert post");
+    }
+
+    /// The URIs of `results`, in order, for comparing against an expected order.
+    fn uris(results: &[SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.uri.as_str()).collect()
     }
 
     fn insert_embedding(path: &Path, rowid: i64, embedding: &[f32; 384]) {
@@ -1170,6 +1195,330 @@ mod tests {
             db.get_cursor().expect("read failed"),
             Some(1_722_000_000_000_001)
         );
+    }
+
+    #[test]
+    fn test_sort_by_created_at_desc_puts_newest_first() {
+        let (_file, path) = create_test_db();
+        insert_post_at(
+            &path,
+            "uri:old",
+            "text",
+            "bluesky",
+            "alice",
+            "2024-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:new",
+            "text",
+            "bluesky",
+            "alice",
+            "2026-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:mid",
+            "text",
+            "bluesky",
+            "alice",
+            "2025-01-01T00:00:00+00:00",
+        );
+
+        let db = Database::open(&path).expect("open failed");
+        let mut results = db
+            .search_fts("text", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        sort_by_created_at_desc(&mut results);
+
+        assert_eq!(uris(&results), vec!["uri:new", "uri:mid", "uri:old"]);
+    }
+
+    #[test]
+    fn test_sort_by_created_at_desc_puts_undatable_rows_last() {
+        let (_file, path) = create_test_db();
+        insert_post_at(&path, "uri:junk", "text", "bluesky", "alice", "not a date");
+        insert_post_at(
+            &path,
+            "uri:dated",
+            "text",
+            "bluesky",
+            "alice",
+            "2024-01-01T00:00:00+00:00",
+        );
+
+        let db = Database::open(&path).expect("open failed");
+        let mut results = db
+            .search_fts("text", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        sort_by_created_at_desc(&mut results);
+
+        assert_eq!(uris(&results), vec!["uri:dated", "uri:junk"]);
+    }
+
+    #[test]
+    fn test_sort_by_created_at_desc_corrects_for_offsets() {
+        // These two sort the wrong way round as text: the earlier instant has
+        // the later wall-clock reading. Only parsing gets this right, so this
+        // is what the Rust-side re-sort buys over SQLite's text comparison.
+        let (_file, path) = create_test_db();
+        insert_post_at(
+            &path,
+            "uri:earlier",
+            "text",
+            "bluesky",
+            "alice",
+            "2026-03-29T10:00:00+05:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:later",
+            "text",
+            "bluesky",
+            "alice",
+            "2026-03-29T09:00:00+00:00",
+        );
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_fts("text", 10, None, None, Order::DateDesc)
+            .expect("search failed");
+
+        assert_eq!(uris(&results), vec!["uri:later", "uri:earlier"]);
+    }
+
+    #[test]
+    fn test_keyword_date_order_overrides_relevance() {
+        let (_file, path) = create_test_db();
+        // The old post repeats the term, so BM25 ranks it above the new one.
+        insert_post_at(
+            &path,
+            "uri:old",
+            "ferrets ferrets ferrets",
+            "bluesky",
+            "alice",
+            "2024-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:new",
+            "ferrets, briefly",
+            "bluesky",
+            "alice",
+            "2026-01-01T00:00:00+00:00",
+        );
+
+        let db = Database::open(&path).expect("open failed");
+
+        let by_relevance = db
+            .search_fts("ferrets", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(uris(&by_relevance), vec!["uri:old", "uri:new"]);
+
+        let by_date = db
+            .search_fts("ferrets", 10, None, None, Order::DateDesc)
+            .expect("search failed");
+        assert_eq!(uris(&by_date), vec!["uri:new", "uri:old"]);
+    }
+
+    #[test]
+    fn test_keyword_date_order_displaces_stronger_older_match() {
+        // The behaviour that makes this an override rather than a tiebreak:
+        // at limit 1 the recent weak match wins over the older strong one.
+        let (_file, path) = create_test_db();
+        insert_post_at(
+            &path,
+            "uri:old",
+            "ferrets ferrets ferrets",
+            "bluesky",
+            "alice",
+            "2024-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:new",
+            "ferrets, briefly",
+            "bluesky",
+            "alice",
+            "2026-01-01T00:00:00+00:00",
+        );
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_fts("ferrets", 1, None, None, Order::DateDesc)
+            .expect("search failed");
+
+        assert_eq!(uris(&results), vec!["uri:new"]);
+    }
+
+    #[test]
+    fn test_keyword_date_order_respects_filters() {
+        let (_file, path) = create_test_db();
+        insert_post_at(
+            &path,
+            "uri:1",
+            "ferrets",
+            "bluesky",
+            "alice",
+            "2026-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:2",
+            "ferrets",
+            "mastodon",
+            "alice",
+            "2026-06-01T00:00:00+00:00",
+        );
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_fts("ferrets", 10, Some("bluesky"), None, Order::DateDesc)
+            .expect("search failed");
+
+        assert_eq!(uris(&results), vec!["uri:1"], "newer post is filtered out");
+    }
+
+    #[test]
+    fn test_semantic_date_order_overrides_distance() {
+        let (_file, path) = create_test_db();
+        insert_post_at(
+            &path,
+            "uri:close-old",
+            "rustacean",
+            "bluesky",
+            "alice",
+            "2024-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:far-new",
+            "rustacean",
+            "bluesky",
+            "alice",
+            "2026-01-01T00:00:00+00:00",
+        );
+
+        let mut close = [0.0f32; 384];
+        close[0] = 1.0;
+        let mut far = [0.0f32; 384];
+        far[0] = 0.2;
+        insert_embedding(&path, 1, &close);
+        insert_embedding(&path, 2, &far);
+
+        let mut query = [0.0f32; 384];
+        query[0] = 1.0;
+
+        let db = Database::open(&path).expect("open failed");
+
+        let by_distance = db
+            .search_vec(&query, 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(uris(&by_distance), vec!["uri:close-old", "uri:far-new"]);
+
+        let by_date = db
+            .search_vec(&query, 10, None, None, Order::DateDesc)
+            .expect("search failed");
+        assert_eq!(uris(&by_date), vec!["uri:far-new", "uri:close-old"]);
+    }
+
+    #[test]
+    fn test_hybrid_date_order_overrides_rrf() {
+        let (_file, path) = create_test_db();
+        insert_post_at(
+            &path,
+            "uri:old",
+            "rustacean programming language",
+            "bluesky",
+            "alice",
+            "2024-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:new",
+            "rustacean notes",
+            "bluesky",
+            "bob",
+            "2026-01-01T00:00:00+00:00",
+        );
+
+        let mut emb1 = [0.0f32; 384];
+        emb1[0] = 1.0;
+        let mut emb2 = [0.0f32; 384];
+        emb2[0] = 0.95;
+        insert_embedding(&path, 1, &emb1);
+        insert_embedding(&path, 2, &emb2);
+
+        let mut query = [0.0f32; 384];
+        query[0] = 1.0;
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_hybrid(
+                "rustacean",
+                Some(&query),
+                10,
+                None,
+                None,
+                1.05,
+                Order::DateDesc,
+            )
+            .expect("hybrid search failed");
+
+        assert_eq!(uris(&results), vec!["uri:new", "uri:old"]);
+        // The merge still records how each post was found; only order changed.
+        assert!(results.iter().all(|r| r.rrf_score.is_some()));
+    }
+
+    #[test]
+    fn test_hybrid_date_order_applies_to_single_source_fallback() {
+        // No embeddings, so the keyword-only fallback path returns the results.
+        let (_file, path) = create_test_db();
+        insert_post_at(
+            &path,
+            "uri:old",
+            "ferrets ferrets ferrets",
+            "bluesky",
+            "alice",
+            "2024-01-01T00:00:00+00:00",
+        );
+        insert_post_at(
+            &path,
+            "uri:new",
+            "ferrets, briefly",
+            "bluesky",
+            "alice",
+            "2026-01-01T00:00:00+00:00",
+        );
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_hybrid("ferrets", None, 10, None, None, 1.05, Order::DateDesc)
+            .expect("hybrid search failed");
+
+        assert_eq!(uris(&results), vec!["uri:new", "uri:old"]);
+    }
+
+    #[test]
+    fn test_date_order_still_honours_limit() {
+        let (_file, path) = create_test_db();
+        for year in [2022, 2023, 2024, 2025, 2026] {
+            insert_post_at(
+                &path,
+                &format!("uri:{year}"),
+                "ferrets",
+                "bluesky",
+                "alice",
+                &format!("{year}-01-01T00:00:00+00:00"),
+            );
+        }
+
+        let db = Database::open(&path).expect("open failed");
+        let results = db
+            .search_fts("ferrets", 2, None, None, Order::DateDesc)
+            .expect("search failed");
+
+        assert_eq!(uris(&results), vec!["uri:2026", "uri:2025"]);
     }
 
     #[test]
