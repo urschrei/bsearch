@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS posts (
 
 CREATE INDEX IF NOT EXISTS idx_posts_source ON posts(source);
 CREATE INDEX IF NOT EXISTS idx_posts_has_embedding ON posts(has_embedding);
+
+-- Liked post URIs awaiting resolution. Written and drained by the Rust daemon,
+-- which persists its queue so that a restart cannot drop a like whose event
+-- the cursor has already moved past. Declared here too because either tool may
+-- create the database and both must produce the same schema.
+CREATE TABLE IF NOT EXISTS pending_likes (
+    uri TEXT PRIMARY KEY,
+    queued_at TEXT NOT NULL
+);
 """
 
 VEC_TABLE_SQL = """

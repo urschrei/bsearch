@@ -2,7 +2,6 @@ mod config;
 mod jetstream;
 mod resolver;
 
-use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,7 +56,6 @@ async fn run() -> Result<()> {
     let db = Database::open_read_write(&config.db_path)
         .with_context(|| format!("Failed to open database at {}", config.db_path.display()))?;
     let db = Arc::new(Mutex::new(db));
-    let pending_likes = Arc::new(Mutex::new(VecDeque::new()));
 
     let token = CancellationToken::new();
     spawn_signal_handler(token.clone());
@@ -66,14 +64,12 @@ async fn run() -> Result<()> {
 
     let handler = Arc::new(jetstream::IngestHandler::new(
         db.clone(),
-        pending_likes.clone(),
         config.handle.clone(),
     ));
 
     let likes = tokio::spawn(resolve_likes_loop(
         config.clone(),
         db.clone(),
-        pending_likes,
         resolver,
         token.clone(),
     ));
@@ -184,12 +180,18 @@ async fn embedding_loop(
 
 /// Periodically drain the queued like URIs and index the posts behind them.
 ///
-/// Port of `Service._resolve_likes_loop`, including its re-queueing of a batch
-/// that failed to resolve.
+/// Port of `Service._resolve_likes_loop`, except that the queue lives in the
+/// database rather than in memory. URIs are read, not removed, and deleted only
+/// once the batch has been resolved; a failure -- or a crash, or a restart --
+/// therefore leaves them queued for the next pass instead of losing them. The
+/// retry is safe because inserting a post already present is ignored.
+///
+/// A resolved batch is cleared in full, including URIs the API returned nothing
+/// for. Those are posts that have since been deleted, and keeping them would
+/// mean retrying them forever.
 async fn resolve_likes_loop(
     config: config::Config,
     db: Arc<Mutex<Database>>,
-    pending_likes: Arc<Mutex<VecDeque<String>>>,
     resolver: Arc<resolver::Resolver>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -200,10 +202,9 @@ async fn resolve_likes_loop(
             () = tokio::time::sleep(interval) => {}
         }
 
-        let uris: Vec<String> = {
-            let mut queue = pending_likes.lock().await;
-            let take = queue.len().min(resolver::MAX_URIS_PER_CALL);
-            queue.drain(..take).collect()
+        let uris = {
+            let db = db.lock().await;
+            db.take_pending_likes(resolver::MAX_URIS_PER_CALL)?
         };
         if uris.is_empty() {
             continue;
@@ -221,13 +222,13 @@ async fn resolve_likes_loop(
                         }
                     }
                 }
+                if let Err(e) = db.remove_pending_likes(&uris) {
+                    // Left queued, so the batch is simply resolved again.
+                    tracing::error!(error = ?e, "Failed to clear resolved likes from the queue");
+                }
             }
             Err(e) => {
-                tracing::error!(error = ?e, "Failed to resolve like batch");
-                let mut queue = pending_likes.lock().await;
-                for uri in uris.into_iter().rev() {
-                    queue.push_front(uri);
-                }
+                tracing::error!(error = ?e, "Failed to resolve like batch; leaving it queued");
             }
         }
     }

@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,20 +27,14 @@ pub const COLLECTION_LIKE: &str = "app.bsky.feed.like";
 /// Mirrors `Service._handle_event` in `src/bsearch/service.py`.
 pub struct IngestHandler {
     db: Arc<Mutex<Database>>,
-    pending_likes: Arc<Mutex<VecDeque<String>>>,
     handle: String,
     id: String,
 }
 
 impl IngestHandler {
-    pub fn new(
-        db: Arc<Mutex<Database>>,
-        pending_likes: Arc<Mutex<VecDeque<String>>>,
-        handle: String,
-    ) -> Self {
+    pub fn new(db: Arc<Mutex<Database>>, handle: String) -> Self {
         Self {
             db,
-            pending_likes,
             handle,
             id: "bsearch-ingest".to_string(),
         }
@@ -82,15 +75,22 @@ impl IngestHandler {
         Ok(())
     }
 
-    async fn handle_like(&self, record: &serde_json::Value) {
+    /// Record a like for later resolution.
+    ///
+    /// The write is durable and its failure is propagated, so that the cursor
+    /// is not advanced past a like we did not manage to record. The event is
+    /// replayed instead, which is harmless: the queue ignores a duplicate URI.
+    async fn handle_like(&self, record: &serde_json::Value) -> Result<()> {
         let uri = record
             .get("subject")
             .and_then(|s| s.get("uri"))
             .and_then(|v| v.as_str());
         if let Some(uri) = uri {
-            self.pending_likes.lock().await.push_back(uri.to_string());
+            let db = self.db.lock().await;
+            db.queue_pending_like(uri)?;
             tracing::debug!(uri = %uri, "Queued like for resolution");
         }
+        Ok(())
     }
 }
 
@@ -119,7 +119,7 @@ impl EventHandler for IngestHandler {
                         self.handle_own_post(did, &commit.rkey, &commit.cid, &commit.record)
                             .await?
                     }
-                    COLLECTION_LIKE => self.handle_like(&commit.record).await,
+                    COLLECTION_LIKE => self.handle_like(&commit.record).await?,
                     _ => {}
                 }
             }
@@ -357,6 +357,7 @@ mod tests {
     use super::*;
     use atproto_jetstream::JetstreamEventCommit;
     use bsearch_core::db::Order;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
     const DID: &str = "did:plc:aefyqfi5jdig6vjfa73debzc";
@@ -600,27 +601,27 @@ mod tests {
         }
     }
 
-    /// The handler under test plus the shared state it writes through. The
-    /// temp file is held so the database outlives the test.
+    /// The handler under test plus the database it writes through. The temp
+    /// file is held so the database outlives the test, and its path is kept so
+    /// a test can reopen it as a restarted daemon would.
     struct Harness {
         _file: NamedTempFile,
+        path: PathBuf,
         handler: IngestHandler,
         db: Arc<Mutex<Database>>,
-        queue: Arc<Mutex<VecDeque<String>>>,
     }
 
     fn harness() -> Harness {
         let file = NamedTempFile::new().expect("temp file");
-        let db = Database::open_read_write(file.path()).expect("open db");
+        let path = file.path().to_path_buf();
+        let db = Database::open_read_write(&path).expect("open db");
         let db = Arc::new(Mutex::new(db));
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let handler =
-            IngestHandler::new(db.clone(), queue.clone(), "alice.bsky.social".to_string());
+        let handler = IngestHandler::new(db.clone(), "alice.bsky.social".to_string());
         Harness {
             _file: file,
+            path,
             handler,
             db,
-            queue,
         }
     }
 
@@ -672,7 +673,6 @@ mod tests {
     #[tokio::test]
     async fn test_like_is_queued_not_indexed() {
         let h = harness();
-        let (handler, db, queue) = (&h.handler, &h.db, &h.queue);
         let liked = "at://did:plc:other/app.bsky.feed.post/abc";
         let event = commit_event(
             COLLECTION_LIKE,
@@ -680,18 +680,76 @@ mod tests {
             serde_json::json!({"subject": {"uri": liked, "cid": "bafy"}}),
         );
 
-        handler
+        h.handler
             .handle_event(Arc::new(event))
             .await
             .expect("handle failed");
 
-        assert_eq!(queue.lock().await.iter().collect::<Vec<_>>(), vec![liked]);
-        let db = db.lock().await;
+        let db = h.db.lock().await;
+        assert_eq!(
+            db.take_pending_likes(10).expect("read queue"),
+            vec![liked.to_string()]
+        );
         assert!(
             db.get_posts_without_embeddings(10)
                 .expect("query")
                 .is_empty(),
             "the like itself must not be indexed; only the post it points at"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_queued_like_survives_restart() {
+        // The gap this closes: the cursor advances past a like as soon as it is
+        // queued, so a queue that lived only in memory lost it on restart with
+        // nothing left to say it had been there.
+        let liked = "at://did:plc:other/app.bsky.feed.post/durable";
+        let h = harness();
+
+        h.handler
+            .handle_event(Arc::new(commit_event(
+                COLLECTION_LIKE,
+                "create",
+                serde_json::json!({"subject": {"uri": liked, "cid": "bafy"}}),
+            )))
+            .await
+            .expect("handle failed");
+
+        // The cursor has already moved on, so the queue is the only record.
+        {
+            let db = h.db.lock().await;
+            assert!(db.get_cursor().expect("cursor").is_some());
+        }
+        drop(h.db);
+
+        let restarted = Database::open_read_write(&h.path).expect("reopen db");
+        assert_eq!(
+            restarted.take_pending_likes(10).expect("read queue"),
+            vec![liked.to_string()],
+            "a queued like must outlive the process that queued it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replayed_like_is_queued_once() {
+        let h = harness();
+        let liked = "at://did:plc:other/app.bsky.feed.post/abc";
+        let event = || {
+            Arc::new(commit_event(
+                COLLECTION_LIKE,
+                "create",
+                serde_json::json!({"subject": {"uri": liked, "cid": "bafy"}}),
+            ))
+        };
+
+        h.handler.handle_event(event()).await.expect("first");
+        h.handler.handle_event(event()).await.expect("replay");
+
+        let db = h.db.lock().await;
+        assert_eq!(
+            db.count_pending_likes().expect("count"),
+            1,
+            "a replayed event must not queue the same like twice"
         );
     }
 

@@ -10,7 +10,10 @@ use rusqlite::Connection;
 use rusqlite::OpenFlags;
 use rusqlite::OptionalExtension;
 
+use chrono::Local;
+
 use crate::models::created_at_sort_key;
+use crate::models::format_indexed_at;
 use crate::models::Post;
 
 /// Schema statements, kept byte-for-byte in step with `src/bsearch/db.py`.
@@ -37,6 +40,11 @@ CREATE TABLE IF NOT EXISTS posts (
 
 CREATE INDEX IF NOT EXISTS idx_posts_source ON posts(source);
 CREATE INDEX IF NOT EXISTS idx_posts_has_embedding ON posts(has_embedding);
+
+CREATE TABLE IF NOT EXISTS pending_likes (
+    uri TEXT PRIMARY KEY,
+    queued_at TEXT NOT NULL
+);
 ";
 
 const VEC_TABLE_SQL: &str = "
@@ -274,6 +282,55 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Record a liked post's URI as needing resolution.
+    ///
+    /// A like event names the liked post but does not carry its text, so the
+    /// URI has to be held until it can be fetched. Holding it in memory meant
+    /// the cursor advanced past a like that was still only queued, so a crash
+    /// or a restart in between dropped it with nothing left to say it had
+    /// existed. Duplicates are ignored: the same post may be liked again, and
+    /// a replayed event must not enqueue it twice.
+    pub fn queue_pending_like(&self, uri: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO pending_likes (uri, queued_at) VALUES (?1, ?2)",
+            rusqlite::params![uri, format_indexed_at(Local::now().naive_local())],
+        )?;
+        Ok(())
+    }
+
+    /// The oldest queued like URIs, in the order they arrived.
+    ///
+    /// These are read rather than removed; call [`Self::remove_pending_likes`]
+    /// once they have been dealt with, so that a failure leaves them queued.
+    pub fn take_pending_likes(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uri FROM pending_likes ORDER BY rowid LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Drop queued like URIs that no longer need resolution.
+    ///
+    /// Each delete stands alone, so a crash partway leaves the remainder
+    /// queued; re-resolving them is harmless because post inserts ignore a URI
+    /// that is already present.
+    pub fn remove_pending_likes(&self, uris: &[String]) -> Result<()> {
+        for uri in uris {
+            self.conn
+                .execute("DELETE FROM pending_likes WHERE uri = ?1", [uri])?;
+        }
+        Ok(())
+    }
+
+    /// How many like URIs are waiting to be resolved.
+    pub fn count_pending_likes(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT count(*) FROM pending_likes", [], |row| row.get(0))
+            .map_err(Into::into)
     }
 
     /// Read the stored Jetstream cursor (microseconds since the epoch).
@@ -1065,6 +1122,7 @@ mod tests {
             "index idx_posts_has_embedding",
             "index idx_posts_source",
             "index sqlite_autoindex_meta_1",
+            "index sqlite_autoindex_pending_likes_1",
             "index sqlite_autoindex_posts_1",
             "index sqlite_autoindex_vec_posts_info_1",
             "index sqlite_autoindex_vec_posts_vector_chunks00_1",
@@ -1074,6 +1132,7 @@ mod tests {
             "table fts_posts_docsize",
             "table fts_posts_idx",
             "table meta",
+            "table pending_likes",
             "table posts",
             "table sqlite_sequence",
             "table vec_posts",
@@ -1174,6 +1233,78 @@ mod tests {
         }
         let pending = db.get_posts_without_embeddings(3).expect("query failed");
         assert_eq!(pending.len(), 3);
+    }
+
+    #[test]
+    fn test_pending_likes_are_returned_in_arrival_order() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+
+        for uri in ["at://a", "at://b", "at://c"] {
+            db.queue_pending_like(uri).expect("queue failed");
+        }
+
+        assert_eq!(
+            db.take_pending_likes(10).expect("read failed"),
+            vec!["at://a", "at://b", "at://c"]
+        );
+        assert_eq!(
+            db.take_pending_likes(2).expect("read failed"),
+            vec!["at://a", "at://b"],
+            "a limit must take the oldest, not an arbitrary subset"
+        );
+    }
+
+    #[test]
+    fn test_take_pending_likes_does_not_consume() {
+        // Resolution can fail, so reading must leave the queue intact; only
+        // remove_pending_likes drops entries.
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.queue_pending_like("at://a").expect("queue failed");
+
+        assert_eq!(db.take_pending_likes(10).expect("read failed").len(), 1);
+        assert_eq!(
+            db.take_pending_likes(10).expect("read failed").len(),
+            1,
+            "reading twice must return the same entry"
+        );
+    }
+
+    #[test]
+    fn test_remove_pending_likes_drops_only_the_named() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        for uri in ["at://a", "at://b", "at://c"] {
+            db.queue_pending_like(uri).expect("queue failed");
+        }
+
+        db.remove_pending_likes(&["at://a".to_string(), "at://c".to_string()])
+            .expect("remove failed");
+
+        assert_eq!(
+            db.take_pending_likes(10).expect("read failed"),
+            vec!["at://b"]
+        );
+    }
+
+    #[test]
+    fn test_queue_pending_like_ignores_duplicates() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.queue_pending_like("at://a").expect("queue failed");
+        db.queue_pending_like("at://a").expect("requeue failed");
+
+        assert_eq!(db.count_pending_likes().expect("count failed"), 1);
+    }
+
+    #[test]
+    fn test_removing_an_unqueued_like_is_not_an_error() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.remove_pending_likes(&["at://never-queued".to_string()])
+            .expect("removing an absent uri should be a no-op");
+        assert_eq!(db.count_pending_likes().expect("count failed"), 0);
     }
 
     #[test]
