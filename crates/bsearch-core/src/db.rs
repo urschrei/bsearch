@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
@@ -9,6 +10,7 @@ use rusqlite::Connection;
 use rusqlite::OpenFlags;
 use rusqlite::OptionalExtension;
 
+use crate::models::created_at_sort_key;
 use crate::models::Post;
 
 /// Schema statements, kept byte-for-byte in step with `src/bsearch/db.py`.
@@ -81,6 +83,38 @@ impl fmt::Display for MatchType {
             Self::KeywordAndSemantic => write!(f, "keyword+semantic"),
         }
     }
+}
+
+/// How search results should be ranked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Order {
+    /// Best match first, by whichever score the search mode produces.
+    #[default]
+    Relevance,
+    /// Newest first. This replaces the relevance ranking rather than breaking
+    /// ties within it, so it changes which posts are returned, not just their
+    /// order: a recent weak match can displace an older strong one.
+    DateDesc,
+}
+
+/// How many candidates to retrieve per requested result when ordering by date.
+///
+/// Vector search is k-nearest-neighbour and the hybrid merge is built on rank
+/// positions, so neither has an "all matching posts" set to order by date --
+/// both must draw from a fixed-size pool of the best matches. Widening the
+/// pool costs little at this database size and makes it far more likely that
+/// the newest of the genuinely relevant posts are in it. Keyword search has no
+/// such limit and orders in SQL across every match.
+const DATE_ORDER_POOL_MULTIPLIER: usize = 20;
+
+/// Re-order results newest first, in place.
+///
+/// The sort is stable, so posts sharing a timestamp keep the relative order the
+/// search gave them. Timestamps that will not parse sort last, on the grounds
+/// that a row we cannot date should not be presented as the most recent.
+pub fn sort_by_created_at_desc(results: &mut [SearchResult]) {
+    // `None` orders below `Some`, so reversing the key puts undatable rows last.
+    results.sort_by_cached_key(|r| Reverse(created_at_sort_key(&r.created_at)));
 }
 
 #[derive(Debug)]
@@ -270,18 +304,19 @@ impl Database {
         limit: usize,
         source_filter: Option<&str>,
         handle_filter: Option<&str>,
+        order: Order,
     ) -> Result<Vec<SearchResult>> {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
 
-        match self.run_fts_query(query, limit, source_filter, handle_filter) {
+        match self.run_fts_query(query, limit, source_filter, handle_filter, order) {
             Ok(results) => Ok(results),
             Err(e) => {
                 // FTS5 syntax errors manifest as generic sqlite errors;
                 // retry the query wrapped as a phrase literal.
                 let phrase = format!("\"{}\"", query.replace('"', ""));
-                match self.run_fts_query(&phrase, limit, source_filter, handle_filter) {
+                match self.run_fts_query(&phrase, limit, source_filter, handle_filter, order) {
                     Ok(results) => Ok(results),
                     Err(retry_err) => {
                         // If both attempts fail, propagate the original error
@@ -300,6 +335,7 @@ impl Database {
         limit: usize,
         source_filter: Option<&str>,
         handle_filter: Option<&str>,
+        order: Order,
     ) -> Result<Vec<SearchResult>> {
         let mut conditions = vec!["fts_posts MATCH ?1".to_string()];
         let mut param_idx = 2usize;
@@ -314,6 +350,16 @@ impl Database {
         }
 
         let where_clause = conditions.join(" AND ");
+        // Ordering by date here rather than trimming a relevance-ranked pool
+        // afterwards means the limit applies to every matching post, so the
+        // newest matches are found however weakly they score. SQLite compares
+        // the timestamps as text; the caller re-sorts the returned rows with
+        // `sort_by_created_at_desc`, which corrects the handful of stored forms
+        // where text order and chronological order come apart.
+        let order_clause = match order {
+            Order::Relevance => "fts_posts.rank",
+            Order::DateDesc => "p.created_at DESC",
+        };
         let sql = format!(
             "SELECT p.id, fts_posts.rank AS bm25_rank,
                     p.uri, p.cid, p.author_did, p.author_handle, p.text,
@@ -321,9 +367,9 @@ impl Database {
              FROM fts_posts
              INNER JOIN posts p ON p.id = fts_posts.rowid
              WHERE {}
-             ORDER BY fts_posts.rank
+             ORDER BY {}
              LIMIT ?{}",
-            where_clause, param_idx
+            where_clause, order_clause, param_idx
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -369,12 +415,15 @@ impl Database {
         limit: usize,
         source_filter: Option<&str>,
         handle_filter: Option<&str>,
+        order: Order,
     ) -> Result<Vec<SearchResult>> {
-        // Over-fetch when filters are active so we have enough results after filtering
-        let fetch_limit = if source_filter.is_some() || handle_filter.is_some() {
-            limit * 5
-        } else {
-            limit
+        // Over-fetch when filters are active so we have enough results after
+        // filtering, and again when ordering by date, since the newest close
+        // matches need not be the closest ones.
+        let fetch_limit = match order {
+            Order::DateDesc => limit * DATE_ORDER_POOL_MULTIPLIER,
+            Order::Relevance if source_filter.is_some() || handle_filter.is_some() => limit * 5,
+            Order::Relevance => limit,
         };
 
         let bytes: Vec<u8> = query_embedding
@@ -417,11 +466,19 @@ impl Database {
         if let Some(h) = handle_filter {
             results.retain(|r| r.author_handle == h);
         }
+        if order == Order::DateDesc {
+            sort_by_created_at_desc(&mut results);
+        }
         results.truncate(limit);
 
         Ok(results)
     }
 
+    // The argument list is at the point where grouping the limit, filters and
+    // ordering into a shared parameter struct would read better across all
+    // three search methods. Left as is for now to keep this signature in the
+    // same shape as `search_fts` and `search_vec`.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_hybrid(
         &self,
         query: &str,
@@ -430,12 +487,33 @@ impl Database {
         source_filter: Option<&str>,
         handle_filter: Option<&str>,
         max_semantic_distance: f64,
+        order: Order,
     ) -> Result<Vec<SearchResult>> {
-        let fetch_limit = limit * 3;
+        // Reciprocal rank fusion scores a post by where each search ranked it,
+        // so both sub-queries must stay relevance-ordered whatever the caller
+        // asked for. Date ordering is applied to the merged set instead, drawn
+        // from a wider pool so that recent posts outside the top few relevance
+        // ranks can still surface.
+        let fetch_limit = match order {
+            Order::Relevance => limit * 3,
+            Order::DateDesc => limit * DATE_ORDER_POOL_MULTIPLIER,
+        };
 
-        let fts_results = self.search_fts(query, fetch_limit, source_filter, handle_filter)?;
+        let fts_results = self.search_fts(
+            query,
+            fetch_limit,
+            source_filter,
+            handle_filter,
+            Order::Relevance,
+        )?;
         let vec_results = if let Some(emb) = query_embedding {
-            self.search_vec(emb, fetch_limit, source_filter, handle_filter)?
+            self.search_vec(
+                emb,
+                fetch_limit,
+                source_filter,
+                handle_filter,
+                Order::Relevance,
+            )?
         } else {
             vec![]
         };
@@ -446,6 +524,9 @@ impl Database {
             for r in &mut out {
                 r.match_type = Some(MatchType::Semantic);
             }
+            if order == Order::DateDesc {
+                sort_by_created_at_desc(&mut out);
+            }
             out.truncate(limit);
             return Ok(out);
         }
@@ -453,6 +534,9 @@ impl Database {
             let mut out = fts_results;
             for r in &mut out {
                 r.match_type = Some(MatchType::Keyword);
+            }
+            if order == Order::DateDesc {
+                sort_by_created_at_desc(&mut out);
             }
             out.truncate(limit);
             return Ok(out);
@@ -518,7 +602,12 @@ impl Database {
             .map(|id| (id, rrf_scores[&id]))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
+        if order == Order::Relevance {
+            // Ordering by date keeps every candidate for now: cutting to the
+            // limit on RRF score first would discard the recent posts the sort
+            // below exists to surface.
+            scored.truncate(limit);
+        }
 
         let mut out = Vec::with_capacity(scored.len());
         for (id, score) in scored {
@@ -534,6 +623,11 @@ impl Database {
                 });
                 out.push(r);
             }
+        }
+
+        if order == Order::DateDesc {
+            sort_by_created_at_desc(&mut out);
+            out.truncate(limit);
         }
 
         Ok(out)
@@ -699,7 +793,7 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_fts("hello", 10, None, None)
+            .search_fts("hello", 10, None, None, Order::Relevance)
             .expect("search failed");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].uri, "uri:1");
@@ -712,10 +806,14 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
 
-        let results = db.search_fts("", 10, None, None).expect("search failed");
+        let results = db
+            .search_fts("", 10, None, None, Order::Relevance)
+            .expect("search failed");
         assert!(results.is_empty());
 
-        let results = db.search_fts("   ", 10, None, None).expect("search failed");
+        let results = db
+            .search_fts("   ", 10, None, None, Order::Relevance)
+            .expect("search failed");
         assert!(results.is_empty());
     }
 
@@ -733,7 +831,7 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_fts("hello", 10, Some("bluesky"), None)
+            .search_fts("hello", 10, Some("bluesky"), None, Order::Relevance)
             .expect("search failed");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, "bluesky");
@@ -753,7 +851,13 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_fts("hello", 10, None, Some("alice.bsky.social"))
+            .search_fts(
+                "hello",
+                10,
+                None,
+                Some("alice.bsky.social"),
+                Order::Relevance,
+            )
             .expect("search failed");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].author_handle, "alice.bsky.social");
@@ -773,7 +877,7 @@ mod tests {
         let db = Database::open(&path).expect("open failed");
         // Broken FTS5 syntax: unmatched quote and stray operators
         let results = db
-            .search_fts("AND OR ( \" broken***", 10, None, None)
+            .search_fts("AND OR ( \" broken***", 10, None, None, Order::Relevance)
             .expect("should not crash");
         // We just verify it doesn't panic; result may be empty
         let _ = results;
@@ -843,7 +947,15 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_hybrid("rustacean", Some(&query_emb), 10, None, None, 1.05)
+            .search_hybrid(
+                "rustacean",
+                Some(&query_emb),
+                10,
+                None,
+                None,
+                1.05,
+                Order::Relevance,
+            )
             .expect("hybrid search failed");
 
         assert!(!results.is_empty(), "should have results");
@@ -870,7 +982,7 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_hybrid("hello", None, 10, None, None, 1.05)
+            .search_hybrid("hello", None, 10, None, None, 1.05, Order::Relevance)
             .expect("hybrid search failed");
 
         assert_eq!(results.len(), 1);
@@ -991,7 +1103,7 @@ mod tests {
 
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_fts("unmistakable", 10, None, None)
+            .search_fts("unmistakable", 10, None, None, Order::Relevance)
             .expect("search failed");
         assert_eq!(results.len(), 1, "trigger should have indexed the post");
         assert_eq!(results[0].uri, "at://uri/1");
@@ -1021,7 +1133,7 @@ mod tests {
         // And it should now be findable by vector search.
         let db = Database::open(&path).expect("open failed");
         let results = db
-            .search_vec(&embedding, 10, None, None)
+            .search_vec(&embedding, 10, None, None, Order::Relevance)
             .expect("vec search failed");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].uri, "at://uri/1");
@@ -1067,7 +1179,15 @@ mod tests {
         let db = Database::open(&path).expect("open failed");
         let query_emb = [0.0f32; 384];
         let results = db
-            .search_hybrid("anything", Some(&query_emb), 10, None, None, 1.05)
+            .search_hybrid(
+                "anything",
+                Some(&query_emb),
+                10,
+                None,
+                None,
+                1.05,
+                Order::Relevance,
+            )
             .expect("hybrid search on empty db failed");
 
         assert!(results.is_empty());

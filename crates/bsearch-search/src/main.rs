@@ -78,6 +78,12 @@ struct Cli {
     /// to 2 (opposite). Only affects results that lack a keyword match.
     #[arg(long, default_value_t = 1.05)]
     max_semantic_distance: f64,
+
+    /// Return the newest matching posts, most recent first.
+    /// This replaces the relevance ranking rather than breaking ties within
+    /// it, so a recent weak match can displace an older strong one.
+    #[arg(short = 'd', long)]
+    newest_first: bool,
 }
 
 fn main() -> Result<()> {
@@ -108,6 +114,12 @@ fn main() -> Result<()> {
 
     let query = cli.query.as_deref().unwrap();
 
+    let order = if cli.newest_first {
+        db::Order::DateDesc
+    } else {
+        db::Order::Relevance
+    };
+
     // Load embedder only for hybrid/semantic modes
     let query_embedding = match cli.mode {
         SearchMode::Keyword => None,
@@ -120,11 +132,11 @@ fn main() -> Result<()> {
 
     let results = match cli.mode {
         SearchMode::Keyword => {
-            database.search_fts(query, cli.limit, source_str, cli.handle.as_deref())?
+            database.search_fts(query, cli.limit, source_str, cli.handle.as_deref(), order)?
         }
         SearchMode::Semantic => {
             let emb = query_embedding.as_ref().unwrap();
-            database.search_vec(emb, cli.limit, source_str, cli.handle.as_deref())?
+            database.search_vec(emb, cli.limit, source_str, cli.handle.as_deref(), order)?
         }
         SearchMode::Hybrid => database.search_hybrid(
             query,
@@ -133,6 +145,7 @@ fn main() -> Result<()> {
             source_str,
             cli.handle.as_deref(),
             cli.max_semantic_distance,
+            order,
         )?,
     };
 

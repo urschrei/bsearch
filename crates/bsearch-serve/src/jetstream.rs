@@ -209,6 +209,7 @@ const RECONNECT_DELAY_SECS: u64 = 5;
 mod tests {
     use super::*;
     use atproto_jetstream::JetstreamEventCommit;
+    use bsearch_core::db::Order;
     use tempfile::NamedTempFile;
 
     const DID: &str = "did:plc:aefyqfi5jdig6vjfa73debzc";
@@ -274,7 +275,7 @@ mod tests {
 
         let db = db.lock().await;
         let results = db
-            .search_fts("ferrets", 10, None, None)
+            .search_fts("ferrets", 10, None, None, Order::Relevance)
             .expect("search failed");
         assert_eq!(
             results.len(),
