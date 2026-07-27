@@ -136,9 +136,19 @@ bsearch-search [OPTIONS] [QUERY]
 | `-s`, `--source` | Filter by source: `own_post`, `like`, `backfill_post`, `backfill_like` |
 | `-m`, `--mode` | Search mode: `hybrid` (default), `keyword`, `semantic` |
 | `-a`, `--handle` | Filter by author handle; with no query, lists posts from that handle |
+| `-d`, `--newest-first` | Return the newest matching posts, most recent first |
 | `--db` | Database path (default: `./bsearch.db`, env: `BSEARCH_DB_PATH`) |
 | `--model` | Model directory (default: `~/.cache/bsearch/all-MiniLM-L6-v2`, env: `BSEARCH_MODEL_DIR`) |
 | `--max-semantic-distance` | L2 distance threshold for semantic-only results in hybrid mode (default: 1.05) |
+
+`--newest-first` replaces the relevance ranking rather than breaking ties
+within it, so it changes which posts come back, not just their order: with
+`-n 10` you get the ten newest matches, and a recent weak match can displace an
+older strong one. Keyword search orders across every matching post. Vector
+search is k-nearest-neighbour and the hybrid merge is built on rank positions,
+so neither has a full match set to order; both instead draw from a pool of the
+best matches twenty times the requested limit. Listing a handle with no query
+is already newest-first, so the flag makes no difference there.
 
 See `crates/bsearch-search/README.md` for details on the embedding pipeline.
 
