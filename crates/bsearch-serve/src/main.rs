@@ -26,6 +26,13 @@ pub fn notify(title: &str, message: &str) {
 }
 
 fn main() -> Result<()> {
+    // The dependency graph carries both rustls crypto providers (ring via
+    // tokio-websockets, aws-lc-rs via its rustls-native-roots feature), and
+    // rustls panics at first use unless exactly one is selected.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
+
     // ONNX Runtime logs its entire graph-optimisation pass at INFO, which is
     // hundreds of lines every time a session is loaded, so it is pinned to
     // warn unless RUST_LOG says otherwise.
