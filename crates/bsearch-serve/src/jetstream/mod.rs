@@ -5,6 +5,7 @@
 
 mod archive;
 mod events;
+mod jss;
 mod live;
 mod v1;
 
