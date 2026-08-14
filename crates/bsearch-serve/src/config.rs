@@ -18,6 +18,13 @@ pub struct Config {
     pub db_path: PathBuf,
     pub model_dir: PathBuf,
     pub jetstream_hostname: String,
+    /// API key for Jetstream's archive endpoints (`planSnapshot`,
+    /// `getSegment`, `getBlock`). The live WebSocket does not use it.
+    /// Without a key the daemon cannot replay archived history and falls
+    /// back to the live tail alone.
+    // Read once the v2 client lands; the allow goes with the switchover.
+    #[allow(dead_code)]
+    pub jetstream_key: Option<String>,
     pub like_batch_interval: u64,
     pub embedding_batch_interval: u64,
     pub reconnect_cursor_safety_seconds: i64,
@@ -85,6 +92,8 @@ impl Config {
         let jetstream_hostname = lookup(&file_values, &["BSEARCH_JETSTREAM_HOSTNAME"])
             .unwrap_or_else(|| DEFAULT_JETSTREAM_HOSTNAME.to_string());
 
+        let jetstream_key = lookup(&file_values, &["BSEARCH_JETSTREAM_KEY", "jetstream_key"]);
+
         Ok(Self {
             handle,
             app_password,
@@ -93,6 +102,7 @@ impl Config {
             db_path,
             model_dir,
             jetstream_hostname,
+            jetstream_key,
             like_batch_interval: 2,
             embedding_batch_interval: 10,
             reconnect_cursor_safety_seconds: 5,
@@ -198,5 +208,26 @@ mod tests {
     fn test_missing_file_is_not_an_error() {
         let values = parse_env_file(Path::new("/nonexistent/.env"));
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_jetstream_key_read_through_alias() {
+        // The `.env` in the wild carries the lower-case alias.
+        let file = write_env("jetstream_key=gk_abc123\n");
+        let values = parse_env_file(file.path());
+        assert_eq!(
+            lookup(&values, &["BSEARCH_JETSTREAM_KEY", "jetstream_key"]),
+            Some("gk_abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_jetstream_key_absence_is_tolerated() {
+        let file = write_env("user=alice\n");
+        let values = parse_env_file(file.path());
+        assert_eq!(
+            lookup(&values, &["BSEARCH_JETSTREAM_KEY", "jetstream_key"]),
+            None
+        );
     }
 }
