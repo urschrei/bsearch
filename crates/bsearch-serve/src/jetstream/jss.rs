@@ -524,6 +524,13 @@ pub(super) mod tests {
         assert_eq!(raw.time_us(), 42);
     }
 
+    /// Write a sealed segment fixture from per-block event lists; the
+    /// entry point sibling test modules use.
+    pub fn write_segment_fixture(path: &Path, blocks: &[Vec<RawEvent>]) {
+        let frames: Vec<Vec<u8>> = blocks.iter().map(|b| compress_block(b)).collect();
+        write_test_segment(path, &frames);
+    }
+
     /// Build a minimal sealed segment file: header, one block, footer
     /// stub. Offsets and the non-zero checksum are what `read_header`
     /// validates; the footer content is never read.

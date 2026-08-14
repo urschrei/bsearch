@@ -7,6 +7,7 @@ mod archive;
 mod events;
 mod jss;
 mod live;
+mod replay;
 mod v1;
 
 pub use v1::{run, IngestHandler};
