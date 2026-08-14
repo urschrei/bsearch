@@ -3,6 +3,7 @@
 //! The daemon talks to Jetstream through this module only; the transport
 //! lives in the submodules.
 
+mod archive;
 mod events;
 mod live;
 mod v1;
