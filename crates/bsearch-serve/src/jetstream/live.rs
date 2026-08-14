@@ -3,7 +3,6 @@
 //! The endpoint is unauthenticated. Frames are `xrpc.v1.json` JSON text
 //! frames; this client never negotiates compression, so binary frames are
 //! unexpected and skipped.
-#![allow(dead_code)]
 
 use anyhow::Result;
 use futures_util::SinkExt;

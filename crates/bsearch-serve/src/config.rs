@@ -22,12 +22,12 @@ pub struct Config {
     /// `getSegment`, `getBlock`). The live WebSocket does not use it.
     /// Without a key the daemon cannot replay archived history and falls
     /// back to the live tail alone.
-    // Read once the v2 client lands; the allow goes with the switchover.
-    #[allow(dead_code)]
     pub jetstream_key: Option<String>,
+    /// Where whole-segment downloads spool so an interrupted transfer
+    /// resumes from its last byte instead of starting over.
+    pub segment_spool_dir: PathBuf,
     pub like_batch_interval: u64,
     pub embedding_batch_interval: u64,
-    pub reconnect_cursor_safety_seconds: i64,
     /// How long a single Jetstream connection may live before it is torn down
     /// and remade.
     ///
@@ -36,24 +36,16 @@ pub struct Config {
     /// the subscription is filtered to one DID, silence is indistinguishable
     /// from an idle account. Recycling on a timer bounds how long ingestion can
     /// stall to this interval. Reconnecting is cheap and replay-safe -- the
-    /// cursor rewinds a few seconds and inserts are `INSERT OR IGNORE` against
-    /// a UNIQUE URI -- so the cost of doing this needlessly is close to nil.
+    /// cursor is inclusive and inserts are `INSERT OR IGNORE` against a UNIQUE
+    /// URI -- so the cost of doing this needlessly is close to nil.
     pub max_connection_seconds: u64,
-    /// How far back Jetstream will replay, and so the oldest cursor worth
-    /// asking for.
-    ///
-    /// A cursor older than the server's window is not refused; playback just
-    /// starts at the oldest event still retained, which makes a gap in our
-    /// history look exactly like an uneventful period. Knowing the window lets
-    /// the daemon spot that case and say so.
-    pub max_cursor_age_seconds: u64,
     /// How long the embedding loop may sit idle before the ONNX session is
     /// dropped. Reloading costs well under a second, and holding the session
     /// open is the difference between roughly 20 MB and 90 MB resident.
     pub embedder_idle_timeout: u64,
 }
 
-const DEFAULT_JETSTREAM_HOSTNAME: &str = "jetstream2.us-east.bsky.network";
+const DEFAULT_JETSTREAM_HOSTNAME: &str = "jetstream.us-east.bsky.network";
 const DEFAULT_PDS_URL: &str = "https://bsky.social";
 
 impl Config {
@@ -80,11 +72,12 @@ impl Config {
 
         // Matches the `~/.cache/bsearch/<model>` layout that
         // `bsearch export-model` writes to and `bsearch-search` reads from.
-        let default_model_dir = dirs::home_dir()
+        let cache_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".cache")
-            .join("bsearch")
-            .join("all-MiniLM-L6-v2");
+            .join("bsearch");
+        let default_model_dir = cache_dir.join("all-MiniLM-L6-v2");
+        let segment_spool_dir = cache_dir.join("segments");
         let model_dir = lookup(&file_values, &["BSEARCH_MODEL_DIR"])
             .map(PathBuf::from)
             .unwrap_or(default_model_dir);
@@ -103,14 +96,12 @@ impl Config {
             model_dir,
             jetstream_hostname,
             jetstream_key,
+            segment_spool_dir,
             like_batch_interval: 2,
             embedding_batch_interval: 10,
-            reconnect_cursor_safety_seconds: 5,
             // The server was observed closing idle connections roughly every
             // seven minutes anyway, so recycling at five keeps us ahead of it.
             max_connection_seconds: 300,
-            // Jetstream's documented backfill window is roughly 72 hours.
-            max_cursor_age_seconds: 72 * 3600,
             embedder_idle_timeout: 300,
         })
     }

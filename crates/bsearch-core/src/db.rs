@@ -333,7 +333,9 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Read the stored Jetstream cursor (microseconds since the epoch).
+    /// Read the stored Jetstream cursor. Historically a `time_us`
+    /// timestamp; the v2 daemon stores a sequence number, telling the two
+    /// apart by magnitude.
     pub fn get_cursor(&self) -> Result<Option<i64>> {
         let value: Option<String> = self
             .conn
@@ -352,6 +354,15 @@ impl Database {
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('cursor', ?1)",
             [cursor.to_string()],
         )?;
+        Ok(())
+    }
+
+    /// Forget the stored cursor, so the next connection starts at the
+    /// live tip. Used when the cursor is unservable and no archive is
+    /// available to close the gap.
+    pub fn clear_cursor(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'cursor'", [])?;
         Ok(())
     }
 
@@ -1326,6 +1337,19 @@ mod tests {
             db.get_cursor().expect("read failed"),
             Some(1_722_000_000_000_001)
         );
+    }
+
+    #[test]
+    fn test_clear_cursor_forgets_the_position() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+
+        db.clear_cursor()
+            .expect("clearing an absent cursor should be a no-op");
+
+        db.set_cursor(42).expect("write failed");
+        db.clear_cursor().expect("clear failed");
+        assert_eq!(db.get_cursor().expect("read failed"), None);
     }
 
     #[test]

@@ -9,10 +9,10 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
-use atproto_jetstream::CancellationToken;
 use bsearch_core::db::Database;
 use bsearch_core::embed::Embedder;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// Send a macOS notification, as `_notify` does in `src/bsearch/jetstream.py`.
 ///

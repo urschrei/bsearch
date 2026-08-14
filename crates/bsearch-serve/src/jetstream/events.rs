@@ -3,7 +3,6 @@
 //! Wire and format references: the `subscribeEvents` lexicon and
 //! `docs/README.md` sections 3.2 and 5.2 in
 //! <https://github.com/bluesky-social/jetstream>.
-#![allow(dead_code)]
 
 use anyhow::Context;
 use anyhow::Result;

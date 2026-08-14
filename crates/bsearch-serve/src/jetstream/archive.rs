@@ -6,7 +6,6 @@
 //! requests, because a segment can run to hundreds of megabytes and the
 //! server meters transfer by byte. Single blocks are small and fetched
 //! into memory.
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::path::PathBuf;

@@ -9,7 +9,6 @@
 //! fixed-width columns, then the concatenated variable-length columns.
 //! zstd frames are written with content checksums, so corruption surfaces
 //! as a decompression error.
-#![allow(dead_code)]
 
 use std::io::Read;
 use std::io::Seek;
@@ -251,6 +250,15 @@ pub fn for_each_block(
     let mut header_bytes = [0u8; 256];
     file.read_exact(&mut header_bytes).context("read header")?;
     let header = read_header(&header_bytes)?;
+    tracing::debug!(
+        path = %path.display(),
+        version = header.version,
+        blocks = header.block_count,
+        events = header.event_count,
+        min_seq = header.min_seq,
+        max_seq = header.max_seq,
+        "Reading sealed segment"
+    );
 
     let mut offset = RESERVED_HEADER_BYTES;
     file.seek(SeekFrom::Start(offset))?;

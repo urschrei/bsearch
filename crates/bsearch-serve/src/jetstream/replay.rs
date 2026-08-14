@@ -6,7 +6,6 @@
 //! window from wherever the cursor reached. All ingestion downstream is
 //! idempotent, and the driver additionally skips rows at or below its
 //! floor, so overlap at every boundary is absorbed.
-#![allow(dead_code)]
 
 use anyhow::bail;
 use anyhow::Context;
@@ -100,8 +99,26 @@ pub async fn replay<F: Fetcher>(
         // while it is downloaded; segments sealed mid-sweep are covered
         // by the live tail's replay after cutover.
         let tip = *pinned_tip.get_or_insert(plan.sealed_tip_seq);
+        tracing::debug!(
+            units = plan.segments.len(),
+            examined = plan.stats.segments_examined,
+            matched = plan.stats.segments_matched,
+            blocks = plan.stats.blocks_matched,
+            entries = plan.stats.entries,
+            planned_through = plan.planned_through_seq,
+            "Snapshot plan page"
+        );
 
         for unit in &plan.segments {
+            tracing::debug!(
+                name = %unit.name,
+                index = unit.index,
+                mode = %unit.mode,
+                min_seq = unit.min_seq,
+                max_seq = unit.max_seq,
+                checksum = %unit.checksum,
+                "Applying plan unit"
+            );
             match apply_unit(
                 fetcher,
                 filters,
