@@ -4,6 +4,7 @@
 //! lives in the submodules.
 
 mod events;
+mod live;
 mod v1;
 
 pub use v1::{run, IngestHandler};
