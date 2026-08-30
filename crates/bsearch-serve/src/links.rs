@@ -13,9 +13,10 @@ use serde_json::Value;
 const FACET_LINK: &str = "app.bsky.richtext.facet#link";
 const EMBED_EXTERNAL: &str = "app.bsky.embed.external";
 const EMBED_RECORD_WITH_MEDIA: &str = "app.bsky.embed.recordWithMedia";
-/// Links back into Bluesky itself -- a quoted post, a profile -- are not
-/// reading material, and Instapaper renders nothing useful for them.
-const EXCLUDED_HOST: &str = "bsky.app";
+/// Hosts whose links are not reading material: Bluesky itself -- a quoted
+/// post, a profile -- and video, for which Instapaper has nothing to show.
+/// Subdomains are excluded with them.
+const EXCLUDED_HOSTS: [&str; 3] = ["bsky.app", "youtube.com", "youtu.be"];
 
 /// A web link found in a post.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,13 +89,15 @@ fn is_web_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
-/// Whether the URL's host is [`EXCLUDED_HOST`] or a subdomain of it.
+/// Whether the URL's host is one of [`EXCLUDED_HOSTS`] or a subdomain of one.
 fn is_excluded(url: &str) -> bool {
     host_of(url).is_some_and(|host| {
-        host == EXCLUDED_HOST
-            || host
-                .strip_suffix(EXCLUDED_HOST)
-                .is_some_and(|prefix| prefix.ends_with('.'))
+        EXCLUDED_HOSTS.iter().any(|excluded| {
+            host == *excluded
+                || host
+                    .strip_suffix(excluded)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
     })
 }
 
@@ -241,6 +244,20 @@ mod tests {
                 "https://example.com/bsky.app"
             ]
         );
+    }
+
+    #[test]
+    fn test_video_links_are_dropped() {
+        let record = json!({
+            "facets": [
+                link_facet("https://www.youtube.com/watch?v=abc"),
+                link_facet("https://youtu.be/abc"),
+                link_facet("https://m.youtube.com/watch?v=abc"),
+                link_facet("https://example.com/youtube.com")
+            ]
+        });
+        let urls: Vec<_> = extract_links(&record).into_iter().map(|l| l.url).collect();
+        assert_eq!(urls, vec!["https://example.com/youtube.com"]);
     }
 
     #[test]
