@@ -6,6 +6,8 @@
 //! Clients write a facet for every URL they detect, so bare text is not
 //! scanned.
 
+use bsearch_core::models::PendingLink;
+use bsearch_core::models::Post;
 use serde_json::Value;
 
 const FACET_LINK: &str = "app.bsky.richtext.facet#link";
@@ -60,6 +62,17 @@ pub fn extract_links(record: &Value) -> Vec<Link> {
     }
 
     links
+}
+
+/// Prepare a link found in `post` for submission, with the post's author
+/// and text as the bookmark description.
+pub fn to_pending(post: &Post, link: &Link) -> PendingLink {
+    PendingLink {
+        url: link.url.clone(),
+        post_uri: post.uri.clone(),
+        title: link.title.clone(),
+        description: format!("@{}: {}", post.author_handle, post.text),
+    }
 }
 
 /// The `external` object of a link-card embed, looking through a
@@ -202,6 +215,28 @@ mod tests {
     fn test_record_without_links_yields_nothing() {
         assert!(extract_links(&json!({"text": "plain"})).is_empty());
         assert!(extract_links(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn test_to_pending_describes_the_post() {
+        let post = Post::new(
+            "at://did:plc:a/app.bsky.feed.post/1".to_string(),
+            "cid".to_string(),
+            "did:plc:a".to_string(),
+            "alice.bsky.social".to_string(),
+            "worth a read".to_string(),
+            "2026-03-29T03:11:21+00:00".to_string(),
+            bsearch_core::models::Source::Like,
+        );
+        let link = Link {
+            url: "https://example.com/".to_string(),
+            title: Some("Example".to_string()),
+        };
+        let pending = to_pending(&post, &link);
+        assert_eq!(pending.url, "https://example.com/");
+        assert_eq!(pending.post_uri, post.uri);
+        assert_eq!(pending.title.as_deref(), Some("Example"));
+        assert_eq!(pending.description, "@alice.bsky.social: worth a read");
     }
 
     #[test]

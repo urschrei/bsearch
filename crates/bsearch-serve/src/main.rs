@@ -83,10 +83,22 @@ async fn run() -> Result<()> {
         token.clone(),
     ));
     let embeddings = tokio::spawn(embedding_loop(config.clone(), db.clone(), token.clone()));
+    let instapaper = config.instapaper.as_ref().map(|settings| {
+        tracing::info!(folder = %settings.folder, "Filing links from liked posts in Instapaper");
+        tokio::spawn(instapaper_loop(
+            settings.clone(),
+            config.instapaper_batch_interval,
+            db.clone(),
+            token.clone(),
+        ))
+    });
 
     jetstream::run(&config, db, handler, token).await?;
     likes.await??;
     embeddings.await??;
+    if let Some(instapaper) = instapaper {
+        instapaper.await??;
+    }
 
     tracing::info!("Service stopped");
     Ok(())
@@ -224,7 +236,19 @@ async fn resolve_likes_loop(
                 let db = db.lock().await;
                 for resolved in &posts {
                     let post = &resolved.post;
-                    match db.insert_post(post) {
+                    // Links are collected only when there is somewhere to
+                    // send them; otherwise the queue would grow unread.
+                    let inserted = if config.instapaper.is_some() {
+                        let links: Vec<_> = resolved
+                            .links
+                            .iter()
+                            .map(|link| links::to_pending(post, link))
+                            .collect();
+                        db.insert_post_with_links(post, &links)
+                    } else {
+                        db.insert_post(post)
+                    };
+                    match inserted {
                         Ok(Some(_)) => tracing::info!(uri = %post.uri, "Indexed liked post"),
                         Ok(None) => {}
                         Err(e) => {
@@ -239,6 +263,119 @@ async fn resolve_likes_loop(
             }
             Err(e) => {
                 tracing::error!(error = ?e, "Failed to resolve like batch; leaving it queued");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many queued links to submit per pass.
+const INSTAPAPER_BATCH_SIZE: usize = 10;
+/// Pause between consecutive submissions, so a burst of likes does not
+/// become a burst of requests.
+const INSTAPAPER_PACING: Duration = Duration::from_secs(1);
+/// How long to wait after a failure before trying again.
+const INSTAPAPER_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// How long to wait after Instapaper reports its rate limit exceeded.
+const INSTAPAPER_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
+
+/// Periodically send queued links to Instapaper.
+///
+/// The queue is drained the way the like queue is: a link is read, sent,
+/// and only then removed, so a failure or a restart leaves it for the next
+/// pass. Resending is harmless, since Instapaper treats a URL it already
+/// holds as an update rather than a duplicate. A link Instapaper rejects
+/// outright -- an invalid URL, a publisher that has opted out -- is dropped,
+/// because retrying it could never succeed.
+///
+/// The session is made on first use and kept for as long as it works. It is
+/// discarded if the folder it was bound to disappears, so that the next pass
+/// finds or recreates the folder; and a failure to connect is reported once
+/// by notification and thereafter only logged, so a wrong password does not
+/// produce a notification every minute.
+async fn instapaper_loop(
+    settings: config::InstapaperConfig,
+    interval_seconds: u64,
+    db: Arc<Mutex<Database>>,
+    token: CancellationToken,
+) -> Result<()> {
+    let interval = Duration::from_secs(interval_seconds);
+    let mut session: Option<instapaper::Session> = None;
+    let mut connect_failure_notified = false;
+    let mut delay = interval;
+
+    loop {
+        tokio::select! {
+            () = token.cancelled() => break,
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = interval;
+
+        let links = {
+            let db = db.lock().await;
+            db.take_pending_links(INSTAPAPER_BATCH_SIZE)?
+        };
+        if links.is_empty() {
+            continue;
+        }
+
+        if session.is_none() {
+            match instapaper::Session::connect(&settings).await {
+                Ok(s) => {
+                    tracing::info!(
+                        folder = %s.folder_title(),
+                        folder_id = s.folder_id(),
+                        "Connected to Instapaper"
+                    );
+                    connect_failure_notified = false;
+                    session = Some(s);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to connect to Instapaper");
+                    if !connect_failure_notified {
+                        notify("bsearch", &format!("Instapaper connection failed: {e}"));
+                        connect_failure_notified = true;
+                    }
+                    delay = INSTAPAPER_RETRY_DELAY;
+                    continue;
+                }
+            }
+        }
+        let Some(current) = session.as_ref() else {
+            continue;
+        };
+
+        for (i, link) in links.iter().enumerate() {
+            if i > 0 {
+                tokio::select! {
+                    () = token.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(INSTAPAPER_PACING) => {}
+                }
+            }
+            match current.add_bookmark(link).await {
+                Ok(bookmark_id) => {
+                    tracing::info!(url = %link.url, bookmark_id, "Saved link to Instapaper");
+                    db.lock().await.remove_pending_link(&link.url)?;
+                }
+                Err(e) if e.is_permanent_for_url() => {
+                    tracing::warn!(url = %link.url, error = %e, "Instapaper rejected link; dropping it");
+                    db.lock().await.remove_pending_link(&link.url)?;
+                }
+                Err(e) if e.is_missing_folder() => {
+                    tracing::warn!(error = %e, "Instapaper folder is gone; reconnecting");
+                    session = None;
+                    break;
+                }
+                Err(e) if e.is_rate_limit() => {
+                    tracing::warn!(error = %e, "Instapaper rate limit reached; pausing");
+                    delay = INSTAPAPER_RATE_LIMIT_DELAY;
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(url = %link.url, error = %e, "Failed to save link to Instapaper; leaving it queued");
+                    delay = INSTAPAPER_RETRY_DELAY;
+                    break;
+                }
             }
         }
     }
