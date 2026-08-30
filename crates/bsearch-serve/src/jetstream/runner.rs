@@ -71,6 +71,22 @@ fn cutover_cursor(outcome: &ReplayOutcome) -> Option<u64> {
     (cursor > 0).then_some(cursor)
 }
 
+/// Whether a sweep's cutover cursor should replace the stored one.
+///
+/// A sweep that applies no events never reaches the ingest path that
+/// stores the cursor, so an idle account's cursor decays until the live
+/// server rejects it and forces a sweep on every recycle. A completed
+/// sweep covers everything up to the cutover, so storing the cutover is
+/// sound. It must not move the cursor backwards: the live tail can be
+/// ahead of the sealed archive. A legacy time_us value is always
+/// replaced, because the sweep that starts from zero migrates it.
+fn cutover_supersedes_stored(cutover: u64, stored: Option<i64>) -> bool {
+    match stored.map(classify_cursor) {
+        Some(StoredCursor::Seq(seq)) => cutover > seq,
+        Some(StoredCursor::LegacyTimeUs(_)) | None => true,
+    }
+}
+
 /// Cancel `connection_token` once `lifetime` has elapsed.
 ///
 /// A socket that dies without a close frame leaves the reader parked on a
@@ -148,7 +164,14 @@ pub async fn run(
                                 ),
                             );
                         }
-                        cutover_cursor(&outcome)
+                        let cursor = cutover_cursor(&outcome);
+                        if let Some(cutover) = cursor
+                            && cutover_supersedes_stored(cutover, stored)
+                        {
+                            let db = db.lock().await;
+                            db.set_cursor(cutover as i64)?;
+                        }
+                        cursor
                     }
                     Err(e) if is_unauthorized(&e) => {
                         // A revoked key cannot heal itself; run degraded
@@ -202,9 +225,11 @@ pub async fn run(
                 match end {
                     ConnectionEnd::Recycled if token.is_cancelled() => break,
                     ConnectionEnd::Recycled => {
-                        tracing::debug!(
+                        // At info so that the log tells a routine recycle
+                        // of a quiet connection from a failure.
+                        tracing::info!(
                             seconds = lifetime.as_secs(),
-                            "Recycling Jetstream connection"
+                            "Recycling quiet Jetstream connection"
                         );
                     }
                     ConnectionEnd::Closed => {
@@ -384,6 +409,27 @@ mod tests {
             events_applied: 0,
         };
         assert_eq!(cutover_cursor(&outcome), None);
+    }
+
+    #[test]
+    fn test_cutover_supersedes_an_older_seq_cursor() {
+        assert!(cutover_supersedes_stored(43, Some(42)));
+    }
+
+    #[test]
+    fn test_cutover_never_moves_the_cursor_backwards() {
+        // The live tail can be ahead of the sealed archive: events applied
+        // live carry seqs beyond the sealed tip.
+        assert!(!cutover_supersedes_stored(41, Some(42)));
+        assert!(!cutover_supersedes_stored(42, Some(42)));
+    }
+
+    #[test]
+    fn test_cutover_supersedes_legacy_and_missing_cursors() {
+        // The sweep for these started from zero, so the cutover covers
+        // everything a legacy or absent cursor could refer to.
+        assert!(cutover_supersedes_stored(42, Some(LEGACY_TIME_US)));
+        assert!(cutover_supersedes_stored(42, None));
     }
 
     #[tokio::test(start_paused = true)]
