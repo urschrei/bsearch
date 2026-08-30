@@ -251,6 +251,81 @@ When running as a launchd agent, logs are written to:
 - `~/Library/Logs/bsearch/stdout.log`
 - `~/Library/Logs/bsearch/stderr.log`
 
+### Log rotation
+
+launchd opens both files itself and hands the descriptors to the daemon,
+which holds them for as long as it runs. This rules out rename-based
+rotation (newsyslog, plain logrotate): the rotator would move the file
+aside and create a fresh one, but the daemon would keep writing to the
+renamed file until its next restart. The descriptors are append-mode,
+though, so copy-then-truncate is safe -- the daemon's next write lands at
+the start of the emptied file and nothing is lost, with no restart needed.
+
+Rotation is a short script, run daily by a second launchd agent. The
+script, installed at `~/.local/bin/bsearch-logrotate`:
+
+```sh
+#!/bin/sh
+# Rotate the bsearch logs that launchd writes.
+# launchd opens these files with O_APPEND, so it is safe to copy the
+# file and then truncate it in place: the server does not lose its
+# file descriptor and subsequent writes go to the start of the file.
+LOGDIR="$HOME/Library/Logs/bsearch"
+KEEP=7
+
+for name in stdout stderr; do
+    f="$LOGDIR/$name.log"
+    # Skip files that are missing or empty.
+    [ -s "$f" ] || continue
+    ts=$(date +%Y%m%d-%H%M%S)
+    cp "$f" "$f.$ts" && : > "$f" && gzip "$f.$ts"
+    # Remove archives beyond the newest KEEP.
+    ls -t "$LOGDIR/$name.log."*.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r old; do
+        rm -- "$old"
+    done
+done
+```
+
+The agent, at `~/Library/LaunchAgents/social.bsky.bsearch.logrotate.plist`,
+runs it at 03:15 each day; launchd runs a missed calendar job once on wake,
+so rotation still happens on a machine that sleeps overnight:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>social.bsky.bsearch.logrotate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/.local/bin/bsearch-logrotate</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+</dict>
+</plist>
+```
+
+Load it with:
+
+```
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/social.bsky.bsearch.logrotate.plist
+```
+
+`KEEP` in the script sets how many gzipped archives are retained per log.
+To remove the agent again:
+
+```
+launchctl bootout gui/$(id -u)/social.bsky.bsearch.logrotate
+```
+
 ## Storage
 
 The database is stored as `bsearch.db` in the working directory (configurable via `BSEARCH_DB_PATH` in `.env`).
