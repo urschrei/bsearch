@@ -290,8 +290,10 @@ const INSTAPAPER_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
 ///
 /// Nothing in here returns early on error: a failure of any kind is logged
 /// and waited out, since the alternative is a task that dies quietly while
-/// the daemon carries on and the queue fills. The session is made on first
-/// use and kept for as long as it works. It is discarded if the folder it
+/// the daemon carries on and the queue fills. The session is made on the
+/// first pass, before there is anything to send, so that bad credentials
+/// show up in the log at startup rather than at the first like; it is then
+/// kept for as long as it works. It is discarded if the folder it
 /// was bound to disappears or the token stops being accepted, so that the
 /// next pass rebuilds it; and a failure to connect is reported once by
 /// notification and thereafter only logged, so a wrong password does not
@@ -313,18 +315,6 @@ async fn instapaper_loop(
             () = tokio::time::sleep(delay) => {}
         }
         delay = interval;
-
-        let links = match db.lock().await.take_pending_links(INSTAPAPER_BATCH_SIZE) {
-            Ok(links) => links,
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to read the Instapaper queue");
-                delay = INSTAPAPER_RETRY_DELAY;
-                continue;
-            }
-        };
-        if links.is_empty() {
-            continue;
-        }
 
         let current = match &session {
             Some(current) => current,
@@ -349,6 +339,18 @@ async fn instapaper_loop(
                 }
             },
         };
+
+        let links = match db.lock().await.take_pending_links(INSTAPAPER_BATCH_SIZE) {
+            Ok(links) => links,
+            Err(e) => {
+                tracing::error!(error = ?e, "Failed to read the Instapaper queue");
+                delay = INSTAPAPER_RETRY_DELAY;
+                continue;
+            }
+        };
+        if links.is_empty() {
+            continue;
+        }
 
         let mut reset_session = false;
         for (i, link) in links.iter().enumerate() {
