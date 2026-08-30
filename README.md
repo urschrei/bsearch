@@ -223,7 +223,8 @@ live tip, since nothing can serve the gap.
 With Instapaper configured, each liked post the daemon indexes for the
 first time has its links -- `app.bsky.richtext.facet#link` facets and
 `app.bsky.embed.external` cards, not URLs scanned out of the text -- written
-to a `pending_links` queue in the same transaction as the post. A separate
+to a `pending_links` queue in the same transaction as the post. Links into
+Bluesky itself (`bsky.app` and its subdomains) are left out. A separate
 task drains that queue, submitting one link a second in batches of ten, with
 the card's title if it has one and the post's author and text as the
 bookmark description. Posts that were already indexed, by an earlier run or

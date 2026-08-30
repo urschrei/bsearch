@@ -13,6 +13,9 @@ use serde_json::Value;
 const FACET_LINK: &str = "app.bsky.richtext.facet#link";
 const EMBED_EXTERNAL: &str = "app.bsky.embed.external";
 const EMBED_RECORD_WITH_MEDIA: &str = "app.bsky.embed.recordWithMedia";
+/// Links back into Bluesky itself -- a quoted post, a profile -- are not
+/// reading material, and Instapaper renders nothing useful for them.
+const EXCLUDED_HOST: &str = "bsky.app";
 
 /// A web link found in a post.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +25,8 @@ pub struct Link {
     pub title: Option<String>,
 }
 
-/// Every distinct `http(s)` link in `record`, link card first.
+/// Every distinct `http(s)` link in `record` that leads off Bluesky, link
+/// card first.
 ///
 /// The card goes first because it is the one link that has a title; a
 /// facet for the same URL is then absorbed as a duplicate rather than
@@ -30,7 +34,7 @@ pub struct Link {
 pub fn extract_links(record: &Value) -> Vec<Link> {
     let mut links: Vec<Link> = Vec::new();
     let mut push = |url: &str, title: Option<&str>| {
-        if !is_web_url(url) || links.iter().any(|l| l.url == url) {
+        if !is_web_url(url) || is_excluded(url) || links.iter().any(|l| l.url == url) {
             return;
         }
         links.push(Link {
@@ -82,6 +86,28 @@ fn external_of_embed(embed: &Value) -> Option<&Value> {
 
 fn is_web_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// Whether the URL's host is [`EXCLUDED_HOST`] or a subdomain of it.
+fn is_excluded(url: &str) -> bool {
+    host_of(url).is_some_and(|host| {
+        host == EXCLUDED_HOST
+            || host
+                .strip_suffix(EXCLUDED_HOST)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// The lower-cased host of a URL, without userinfo or port.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split_once(':').map_or(host, |(h, _)| h);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -193,6 +219,42 @@ mod tests {
             "facets": [link_facet("mailto:someone@example.com"), link_facet("ftp://x/y")]
         });
         assert!(extract_links(&record).is_empty());
+    }
+
+    #[test]
+    fn test_links_into_bluesky_are_dropped() {
+        let record = json!({
+            "facets": [
+                link_facet("https://bsky.app/profile/alice.bsky.social/post/3abc"),
+                link_facet("https://BSKY.APP/profile/alice.bsky.social"),
+                link_facet("https://go.bsky.app/abc"),
+                link_facet("https://bsky.app:443/x"),
+                link_facet("https://notbsky.app/article"),
+                link_facet("https://example.com/bsky.app")
+            ]
+        });
+        let urls: Vec<_> = extract_links(&record).into_iter().map(|l| l.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://notbsky.app/article",
+                "https://example.com/bsky.app"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_host_of_strips_userinfo_and_port() {
+        assert_eq!(
+            host_of("https://user:pw@Example.com:8443/p?q#f"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            host_of("https://example.com"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(host_of("https:///nohost"), None);
+        assert_eq!(host_of("nonsense"), None);
     }
 
     #[test]
