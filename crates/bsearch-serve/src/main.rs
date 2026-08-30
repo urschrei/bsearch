@@ -1,3 +1,4 @@
+mod backfill_links;
 mod config;
 mod instapaper;
 mod jetstream;
@@ -13,8 +14,42 @@ use anyhow::Context;
 use anyhow::Result;
 use bsearch_core::db::Database;
 use bsearch_core::embed::Embedder;
+use chrono::NaiveDate;
+use clap::Parser;
+use clap::Subcommand;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+/// Bluesky post and like monitor: the ingest daemon.
+///
+/// With no subcommand, follows the account's Jetstream and indexes posts
+/// and likes until stopped.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    mode: Option<Mode>,
+}
+
+#[derive(Subcommand)]
+enum Mode {
+    /// Queue the links in already-indexed liked posts for Instapaper.
+    ///
+    /// Fetches the posts again to read their link facets and cards, and
+    /// leaves the links in the queue the running daemon drains.
+    BackfillLinks {
+        /// Only posts created on or after this date (YYYY-MM-DD).
+        #[arg(long, value_parser = parse_date)]
+        since: NaiveDate,
+        /// Fetch and list the links without queueing them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+fn parse_date(raw: &str) -> Result<NaiveDate, String> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|e| format!("{raw}: {e}"))
+}
 
 /// Send a macOS notification, as `_notify` does in `src/bsearch/jetstream.py`.
 ///
@@ -28,6 +63,8 @@ pub fn notify(title: &str, message: &str) {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     // The dependency graph carries both rustls crypto providers (ring via
     // tokio-websockets, aws-lc-rs via its rustls-native-roots feature), and
     // rustls panics at first use unless exactly one is selected.
@@ -50,11 +87,15 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run())
+    runtime.block_on(run(cli.mode))
 }
 
-async fn run() -> Result<()> {
+async fn run(mode: Option<Mode>) -> Result<()> {
     let mut config = config::Config::from_env(None)?;
+
+    if let Some(Mode::BackfillLinks { since, dry_run }) = mode {
+        return backfill_links::run(&config, since, dry_run).await;
+    }
 
     let resolver = Arc::new(resolver::Resolver::new(&config));
     let did = resolver.login(&config).await?;

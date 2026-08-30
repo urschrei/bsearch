@@ -32,6 +32,7 @@ zstd = "0.13"
 tokio-util = "0.7.19"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 oauth1-request = "0.6"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile.workspace = true

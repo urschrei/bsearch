@@ -155,6 +155,28 @@ pub struct Database {
     conn: Connection,
 }
 
+/// Queue links through `conn`, which may be a transaction, returning how
+/// many were not already present.
+fn queue_links_on(conn: &Connection, links: &[PendingLink]) -> Result<usize> {
+    let queued_at = format_indexed_at(Local::now().naive_local());
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO pending_links
+             (url, post_uri, title, description, queued_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut queued = 0;
+    for link in links {
+        queued += stmt.execute(rusqlite::params![
+            link.url,
+            link.post_uri,
+            link.title,
+            link.description,
+            queued_at,
+        ])?;
+    }
+    Ok(queued)
+}
+
 /// Insert a post through `conn`, which may be a transaction.
 fn insert_post_on(conn: &Connection, post: &Post) -> Result<Option<i64>> {
     let changed = conn.execute(
@@ -284,24 +306,36 @@ impl Database {
         let tx = self.conn.unchecked_transaction()?;
         let inserted = insert_post_on(&tx, post)?;
         if inserted.is_some() {
-            let queued_at = format_indexed_at(Local::now().naive_local());
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO pending_links
-                     (url, post_uri, title, description, queued_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for link in links {
-                stmt.execute(rusqlite::params![
-                    link.url,
-                    link.post_uri,
-                    link.title,
-                    link.description,
-                    queued_at,
-                ])?;
-            }
+            queue_links_on(&tx, links)?;
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// Queue links regardless of any post, returning how many were new.
+    ///
+    /// For filing links from posts indexed before Instapaper was configured;
+    /// duplicates of links already queued are ignored, as always.
+    pub fn queue_pending_links(&self, links: &[PendingLink]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let queued = queue_links_on(&tx, links)?;
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    /// URIs of liked posts created on or after `since`, oldest first.
+    ///
+    /// `since` is compared as text against the stored `created_at`, so it
+    /// must be a `YYYY-MM-DD` prefix of the ISO form both writers use.
+    pub fn liked_post_uris_since(&self, since: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uri FROM posts
+             WHERE source IN ('like', 'backfill_like') AND created_at >= ?1
+             ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([since], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// The oldest queued links, in the order they arrived.
@@ -1467,6 +1501,43 @@ mod tests {
             .expect("insert failed");
 
         assert_eq!(db.count_pending_links().expect("count failed"), 1);
+    }
+
+    #[test]
+    fn test_queue_pending_links_counts_only_new_urls() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let first = [sample_link("https://a.example/1")];
+        assert_eq!(db.queue_pending_links(&first).expect("queue failed"), 1);
+
+        let again = [
+            sample_link("https://a.example/1"),
+            sample_link("https://a.example/2"),
+        ];
+        assert_eq!(db.queue_pending_links(&again).expect("queue failed"), 1);
+        assert_eq!(db.count_pending_links().expect("count failed"), 2);
+    }
+
+    #[test]
+    fn test_liked_post_uris_since_filters_by_source_and_date() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let liked = |uri: &str, created_at: &str, source| {
+            let mut post = sample_post(uri, "text");
+            post.created_at = created_at.to_string();
+            post.source = source;
+            db.insert_post(&post).expect("insert failed");
+        };
+        liked("at://old", "2025-12-31T23:59:59+00:00", "like");
+        liked("at://new", "2026-03-02T10:00:00.123000+00:00", "like");
+        liked("at://backfilled", "2026-03-01T00:00:00", "backfill_like");
+        liked("at://own", "2026-03-05T00:00:00+00:00", "own_post");
+
+        assert_eq!(
+            db.liked_post_uris_since("2026-03-01")
+                .expect("query failed"),
+            vec!["at://backfilled", "at://new"]
+        );
     }
 
     #[test]
