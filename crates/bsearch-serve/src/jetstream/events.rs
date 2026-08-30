@@ -192,8 +192,8 @@ fn decode_message_payload(payload: serde_json::Value) -> Result<Frame> {
 /// microseconds. The value is informational, so a malformed one becomes 0
 /// rather than an error.
 fn parse_time_us(time: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(time)
-        .map(|dt| dt.timestamp_micros())
+    time.parse::<jiff::Timestamp>()
+        .map(|ts| ts.as_microsecond())
         .unwrap_or(0)
 }
 

@@ -18,7 +18,7 @@ sqlite-vec = "0.1"
 tokenizers = "0.23"
 dotenvy = "0.15"
 dirs = "6"
-chrono = "0.4"
+jiff = "0.2"
 tempfile = "3"
 serial_test = "4"
 

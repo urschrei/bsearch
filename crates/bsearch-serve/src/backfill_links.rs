@@ -12,7 +12,7 @@ use anyhow::Context;
 use anyhow::Result;
 use bsearch_core::db::Database;
 use bsearch_core::models::PendingLink;
-use chrono::NaiveDate;
+use jiff::civil::Date;
 
 use crate::config::Config;
 use crate::links::to_pending;
@@ -21,7 +21,7 @@ use crate::resolver::Resolver;
 /// Posts per progress report; the resolver splits this into API calls.
 const FETCH_BATCH: usize = 100;
 
-pub async fn run(config: &Config, since: NaiveDate, dry_run: bool) -> Result<()> {
+pub async fn run(config: &Config, since: Date, dry_run: bool) -> Result<()> {
     anyhow::ensure!(
         dry_run || config.instapaper.is_some(),
         "Instapaper is not configured in .env, so nothing would drain the queue"

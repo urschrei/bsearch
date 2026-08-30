@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use rusqlite::OpenFlags;
 use rusqlite::OptionalExtension;
 
-use chrono::Local;
+use jiff::Zoned;
 
 use crate::models::PendingLink;
 use crate::models::Post;
@@ -158,7 +158,7 @@ pub struct Database {
 /// Queue links through `conn`, which may be a transaction, returning how
 /// many were not already present.
 fn queue_links_on(conn: &Connection, links: &[PendingLink]) -> Result<usize> {
-    let queued_at = format_indexed_at(Local::now().naive_local());
+    let queued_at = format_indexed_at(Zoned::now().datetime());
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO pending_links
              (url, post_uri, title, description, queued_at)
@@ -415,7 +415,7 @@ impl Database {
     pub fn queue_pending_like(&self, uri: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO pending_likes (uri, queued_at) VALUES (?1, ?2)",
-            rusqlite::params![uri, format_indexed_at(Local::now().naive_local())],
+            rusqlite::params![uri, format_indexed_at(Zoned::now().datetime())],
         )?;
         Ok(())
     }

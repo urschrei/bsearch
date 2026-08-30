@@ -14,9 +14,9 @@ use anyhow::Context;
 use anyhow::Result;
 use bsearch_core::db::Database;
 use bsearch_core::embed::Embedder;
-use chrono::NaiveDate;
 use clap::Parser;
 use clap::Subcommand;
+use jiff::civil::Date;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -40,15 +40,15 @@ enum Mode {
     BackfillLinks {
         /// Only posts created on or after this date (YYYY-MM-DD).
         #[arg(long, value_parser = parse_date)]
-        since: NaiveDate,
+        since: Date,
         /// Fetch and list the links without queueing them.
         #[arg(long)]
         dry_run: bool,
     },
 }
 
-fn parse_date(raw: &str) -> Result<NaiveDate, String> {
-    NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|e| format!("{raw}: {e}"))
+fn parse_date(raw: &str) -> Result<Date, String> {
+    Date::strptime("%Y-%m-%d", raw).map_err(|e| format!("{raw}: {e}"))
 }
 
 /// Send a macOS notification, as `_notify` does in `src/bsearch/jetstream.py`.
