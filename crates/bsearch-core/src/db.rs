@@ -285,19 +285,19 @@ impl Database {
         let inserted = insert_post_on(&tx, post)?;
         if inserted.is_some() {
             let queued_at = format_indexed_at(Local::now().naive_local());
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO pending_links
+                     (url, post_uri, title, description, queued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
             for link in links {
-                tx.execute(
-                    "INSERT OR IGNORE INTO pending_links
-                         (url, post_uri, title, description, queued_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        link.url,
-                        link.post_uri,
-                        link.title,
-                        link.description,
-                        queued_at,
-                    ],
-                )?;
+                stmt.execute(rusqlite::params![
+                    link.url,
+                    link.post_uri,
+                    link.title,
+                    link.description,
+                    queued_at,
+                ])?;
             }
         }
         tx.commit()?;

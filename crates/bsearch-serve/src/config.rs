@@ -162,33 +162,31 @@ fn instapaper_config(file_values: &HashMap<String, String>) -> Result<Option<Ins
         &["BSEARCH_INSTAPAPER_FOLDER", "instapaper_folder"],
     );
 
-    let required = [
-        ("instapaper_consumer_key", &consumer_key),
-        ("instapaper_consumer_secret", &consumer_secret),
-        ("instapaper_username", &username),
-    ];
-    if required.iter().all(|(_, value)| value.is_none()) && password.is_none() && folder.is_none() {
-        return Ok(None);
+    match (consumer_key, consumer_secret, username) {
+        (None, None, None) if password.is_none() && folder.is_none() => Ok(None),
+        (Some(consumer_key), Some(consumer_secret), Some(username)) => Ok(Some(InstapaperConfig {
+            consumer_key,
+            consumer_secret,
+            username,
+            password: password.unwrap_or_default(),
+            folder: folder.unwrap_or_else(|| DEFAULT_INSTAPAPER_FOLDER.to_string()),
+        })),
+        (consumer_key, consumer_secret, username) => {
+            let missing: Vec<&str> = [
+                ("instapaper_consumer_key", consumer_key.is_none()),
+                ("instapaper_consumer_secret", consumer_secret.is_none()),
+                ("instapaper_username", username.is_none()),
+            ]
+            .iter()
+            .filter(|(_, absent)| *absent)
+            .map(|(name, _)| *name)
+            .collect();
+            anyhow::bail!(
+                "Incomplete Instapaper configuration in .env: missing {}",
+                missing.join(", ")
+            )
+        }
     }
-    let missing: Vec<&str> = required
-        .iter()
-        .filter(|(_, value)| value.is_none())
-        .map(|(name, _)| *name)
-        .collect();
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "Incomplete Instapaper configuration in .env: missing {}",
-            missing.join(", ")
-        );
-    }
-
-    Ok(Some(InstapaperConfig {
-        consumer_key: consumer_key.expect("checked above"),
-        consumer_secret: consumer_secret.expect("checked above"),
-        username: username.expect("checked above"),
-        password: password.unwrap_or_default(),
-        folder: folder.unwrap_or_else(|| DEFAULT_INSTAPAPER_FOLDER.to_string()),
-    }))
 }
 
 /// Look a key up in the environment first, then in the parsed `.env` values.

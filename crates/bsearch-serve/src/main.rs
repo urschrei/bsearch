@@ -217,6 +217,7 @@ async fn resolve_likes_loop(
     token: CancellationToken,
 ) -> Result<()> {
     let interval = Duration::from_secs(config.like_batch_interval);
+    let file_links = config.instapaper.is_some();
     loop {
         tokio::select! {
             () = token.cancelled() => break,
@@ -238,17 +239,16 @@ async fn resolve_likes_loop(
                     let post = &resolved.post;
                     // Links are collected only when there is somewhere to
                     // send them; otherwise the queue would grow unread.
-                    let inserted = if config.instapaper.is_some() {
-                        let links: Vec<_> = resolved
+                    let links: Vec<_> = if file_links {
+                        resolved
                             .links
                             .iter()
                             .map(|link| links::to_pending(post, link))
-                            .collect();
-                        db.insert_post_with_links(post, &links)
+                            .collect()
                     } else {
-                        db.insert_post(post)
+                        Vec::new()
                     };
-                    match inserted {
+                    match db.insert_post_with_links(post, &links) {
                         Ok(Some(_)) => tracing::info!(uri = %post.uri, "Indexed liked post"),
                         Ok(None) => {}
                         Err(e) => {
@@ -288,10 +288,13 @@ const INSTAPAPER_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
 /// outright -- an invalid URL, a publisher that has opted out -- is dropped,
 /// because retrying it could never succeed.
 ///
-/// The session is made on first use and kept for as long as it works. It is
-/// discarded if the folder it was bound to disappears, so that the next pass
-/// finds or recreates the folder; and a failure to connect is reported once
-/// by notification and thereafter only logged, so a wrong password does not
+/// Nothing in here returns early on error: a failure of any kind is logged
+/// and waited out, since the alternative is a task that dies quietly while
+/// the daemon carries on and the queue fills. The session is made on first
+/// use and kept for as long as it works. It is discarded if the folder it
+/// was bound to disappears or the token stops being accepted, so that the
+/// next pass rebuilds it; and a failure to connect is reported once by
+/// notification and thereafter only logged, so a wrong password does not
 /// produce a notification every minute.
 async fn instapaper_loop(
     settings: config::InstapaperConfig,
@@ -311,24 +314,29 @@ async fn instapaper_loop(
         }
         delay = interval;
 
-        let links = {
-            let db = db.lock().await;
-            db.take_pending_links(INSTAPAPER_BATCH_SIZE)?
+        let links = match db.lock().await.take_pending_links(INSTAPAPER_BATCH_SIZE) {
+            Ok(links) => links,
+            Err(e) => {
+                tracing::error!(error = ?e, "Failed to read the Instapaper queue");
+                delay = INSTAPAPER_RETRY_DELAY;
+                continue;
+            }
         };
         if links.is_empty() {
             continue;
         }
 
-        if session.is_none() {
-            match instapaper::Session::connect(&settings).await {
-                Ok(s) => {
+        let current = match &session {
+            Some(current) => current,
+            None => match instapaper::Session::connect(&settings).await {
+                Ok(connected) => {
                     tracing::info!(
-                        folder = %s.folder_title(),
-                        folder_id = s.folder_id(),
+                        folder = %connected.folder_title(),
+                        folder_id = connected.folder_id(),
                         "Connected to Instapaper"
                     );
                     connect_failure_notified = false;
-                    session = Some(s);
+                    session.insert(connected)
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to connect to Instapaper");
@@ -339,12 +347,10 @@ async fn instapaper_loop(
                     delay = INSTAPAPER_RETRY_DELAY;
                     continue;
                 }
-            }
-        }
-        let Some(current) = session.as_ref() else {
-            continue;
+            },
         };
 
+        let mut reset_session = false;
         for (i, link) in links.iter().enumerate() {
             if i > 0 {
                 tokio::select! {
@@ -355,28 +361,44 @@ async fn instapaper_loop(
             match current.add_bookmark(link).await {
                 Ok(bookmark_id) => {
                     tracing::info!(url = %link.url, bookmark_id, "Saved link to Instapaper");
-                    db.lock().await.remove_pending_link(&link.url)?;
                 }
-                Err(e) if e.is_permanent_for_url() => {
-                    tracing::warn!(url = %link.url, error = %e, "Instapaper rejected link; dropping it");
-                    db.lock().await.remove_pending_link(&link.url)?;
-                }
-                Err(e) if e.is_missing_folder() => {
-                    tracing::warn!(error = %e, "Instapaper folder is gone; reconnecting");
-                    session = None;
-                    break;
-                }
-                Err(e) if e.is_rate_limit() => {
-                    tracing::warn!(error = %e, "Instapaper rate limit reached; pausing");
-                    delay = INSTAPAPER_RATE_LIMIT_DELAY;
-                    break;
-                }
-                Err(e) => {
-                    tracing::error!(url = %link.url, error = %e, "Failed to save link to Instapaper; leaving it queued");
-                    delay = INSTAPAPER_RETRY_DELAY;
-                    break;
-                }
+                Err(e) => match e.disposition() {
+                    instapaper::Disposition::DropLink => {
+                        tracing::warn!(url = %link.url, error = %e, "Instapaper rejected link; dropping it");
+                    }
+                    instapaper::Disposition::ReconnectFolder => {
+                        tracing::warn!(error = %e, "Instapaper folder is gone; reconnecting");
+                        reset_session = true;
+                        break;
+                    }
+                    instapaper::Disposition::ResetSession => {
+                        tracing::warn!(error = %e, "Instapaper no longer accepts the session; reconnecting");
+                        reset_session = true;
+                        delay = INSTAPAPER_RETRY_DELAY;
+                        break;
+                    }
+                    instapaper::Disposition::RateLimited => {
+                        tracing::warn!(error = %e, "Instapaper rate limit reached; pausing");
+                        delay = INSTAPAPER_RATE_LIMIT_DELAY;
+                        break;
+                    }
+                    instapaper::Disposition::Retry => {
+                        tracing::error!(url = %link.url, error = %e, "Failed to save link to Instapaper; leaving it queued");
+                        delay = INSTAPAPER_RETRY_DELAY;
+                        break;
+                    }
+                },
             }
+            // Reached only for a link that is finished with, saved or
+            // dropped. Failing to forget it means it is sent once more.
+            if let Err(e) = db.lock().await.remove_pending_link(&link.url) {
+                tracing::error!(error = ?e, url = %link.url, "Failed to remove link from the Instapaper queue");
+                delay = INSTAPAPER_RETRY_DELAY;
+                break;
+            }
+        }
+        if reset_session {
+            session = None;
         }
     }
     Ok(())

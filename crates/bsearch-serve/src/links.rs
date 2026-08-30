@@ -45,21 +45,16 @@ pub fn extract_links(record: &Value) -> Vec<Link> {
         }
     }
 
-    let features = record
+    record
         .get("facets")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|facet| facet.get("features").and_then(Value::as_array))
-        .flatten();
-    for feature in features {
-        if feature.get("$type").and_then(Value::as_str) != Some(FACET_LINK) {
-            continue;
-        }
-        if let Some(url) = feature.get("uri").and_then(Value::as_str) {
-            push(url, None);
-        }
-    }
+        .flatten()
+        .filter(|feature| feature.get("$type").and_then(Value::as_str) == Some(FACET_LINK))
+        .filter_map(|feature| feature.get("uri").and_then(Value::as_str))
+        .for_each(|url| push(url, None));
 
     links
 }

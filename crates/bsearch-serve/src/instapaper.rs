@@ -8,18 +8,21 @@
 //! the token exchange, which answers with a query string.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use bsearch_core::models::PendingLink;
 use oauth1_request as oauth;
 use reqwest::header::AUTHORIZATION;
 use reqwest::header::CONTENT_TYPE;
-use reqwest::header::USER_AGENT;
 use serde_json::Value;
 
 use crate::config::InstapaperConfig;
 
 const BASE_URL: &str = "https://www.instapaper.com/api/1";
 const AGENT: &str = concat!("bsearch-serve/", env!("CARGO_PKG_VERSION"));
+/// Bounds how long one call may hold the submission loop, and with it the
+/// daemon's shutdown.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Error codes from the API documentation that matter here.
 pub const RATE_LIMIT_EXCEEDED: u32 = 1040;
@@ -41,46 +44,59 @@ pub enum Error {
     /// a 503 and retry later.
     #[error("Instapaper returned an unreadable response (HTTP {status}): {body}")]
     Unreadable { status: u16, body: String },
+    /// A well-formed response that lacks the item the call should produce.
+    #[error("Instapaper response has no {expected} item: {body}")]
+    MissingItem {
+        expected: &'static str,
+        body: String,
+    },
     #[error("Instapaper rejected the credentials (HTTP {status}): {body}")]
     Auth { status: u16, body: String },
     #[error("Instapaper folder '{0}' could not be found or created")]
     FolderUnavailable(String),
 }
 
+/// What the submission loop should do about a failed call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// The URL itself is at fault, so sending it again can never succeed.
+    DropLink,
+    /// The folder the session is bound to is gone; rebuild the session so
+    /// that the folder is found or created again.
+    ReconnectFolder,
+    /// The token is no longer accepted; rebuild the session.
+    ResetSession,
+    /// Instapaper's rate limit; wait longer than usual before the next pass.
+    RateLimited,
+    /// Anything else: keep the link queued and try again later.
+    Retry,
+}
+
 impl Error {
-    /// Whether the fault lies with the URL itself, so that submitting it
-    /// again can never succeed.
-    pub fn is_permanent_for_url(&self) -> bool {
+    pub fn disposition(&self) -> Disposition {
         match self {
+            // Codes not named here are unknown or account-level; retrying
+            // costs nothing and keeps the link.
             Self::Api { code, .. } => match *code {
                 DOMAIN_REQUIRES_CONTENT
                 | DOMAIN_OPTED_OUT
                 | INVALID_URL
                 | PRIVATE_REQUIRES_CONTENT
-                | TEXT_GENERATION_FAILED => true,
-                RATE_LIMIT_EXCEEDED | INVALID_FOLDER_ID | FOLDER_TITLE_EXISTS => false,
-                _ => false,
+                | TEXT_GENERATION_FAILED => Disposition::DropLink,
+                INVALID_FOLDER_ID => Disposition::ReconnectFolder,
+                RATE_LIMIT_EXCEEDED => Disposition::RateLimited,
+                _ => Disposition::Retry,
             },
-            Self::Http(_) | Self::Unreadable { .. } | Self::Auth { .. } => false,
-            Self::FolderUnavailable(_) => false,
-        }
-    }
-
-    pub fn is_rate_limit(&self) -> bool {
-        match self {
-            Self::Api { code, .. } => *code == RATE_LIMIT_EXCEEDED,
-            Self::Http(_) | Self::Unreadable { .. } | Self::Auth { .. } => false,
-            Self::FolderUnavailable(_) => false,
-        }
-    }
-
-    /// The folder the session was built around no longer exists, so the
-    /// session must be rebuilt to find or create it again.
-    pub fn is_missing_folder(&self) -> bool {
-        match self {
-            Self::Api { code, .. } => *code == INVALID_FOLDER_ID,
-            Self::Http(_) | Self::Unreadable { .. } | Self::Auth { .. } => false,
-            Self::FolderUnavailable(_) => false,
+            // A revoked token does not arrive as an error item but as a
+            // bare 401 or 403.
+            Self::Unreadable { status, .. } => match *status {
+                401 | 403 => Disposition::ResetSession,
+                _ => Disposition::Retry,
+            },
+            Self::Auth { .. } => Disposition::ResetSession,
+            Self::Http(_) | Self::MissingItem { .. } | Self::FolderUnavailable(_) => {
+                Disposition::Retry
+            }
         }
     }
 }
@@ -96,8 +112,8 @@ struct Signer {
 
 impl Signer {
     fn authorization(&self, uri: &str, request: &impl oauth::Request) -> String {
-        let mut builder = oauth::Builder::new(self.consumer.clone(), oauth::HMAC_SHA1);
-        builder.token(self.token.clone());
+        let mut builder = oauth::Builder::new(self.consumer.as_ref(), oauth::HMAC_SHA1);
+        builder.token(self.token.as_ref().map(Credentials::as_ref));
         builder.post(uri, request)
     }
 }
@@ -136,7 +152,10 @@ pub struct Session {
 
 impl Session {
     pub async fn connect(config: &InstapaperConfig) -> Result<Self, Error> {
-        let http = reqwest::Client::builder().build()?;
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(AGENT)
+            .build()?;
         let mut signer = Signer {
             consumer: Credentials::new(config.consumer_key.clone(), config.consumer_secret.clone()),
             token: None,
@@ -178,8 +197,8 @@ impl Session {
             .iter()
             .find(|item| item_type(item) == Some("bookmark"))
             .and_then(|item| lenient_u64(item.get("bookmark_id")))
-            .ok_or_else(|| Error::Unreadable {
-                status: 200,
+            .ok_or_else(|| Error::MissingItem {
+                expected: "bookmark",
                 body: Value::Array(items).to_string(),
             })
     }
@@ -267,7 +286,6 @@ async fn post_signed(
         .post(&uri)
         .header(AUTHORIZATION, authorization)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(USER_AGENT, AGENT)
         .body(body)
         .send()
         .await?;
@@ -308,7 +326,9 @@ fn parse_items(status: u16, body: &str) -> Result<Vec<Value>, Error> {
     };
     if let Some(error) = items.iter().find(|item| item_type(item) == Some("error")) {
         return Err(Error::Api {
-            code: lenient_u64(error.get("error_code")).unwrap_or(0) as u32,
+            code: lenient_u64(error.get("error_code"))
+                .and_then(|code| u32::try_from(code).ok())
+                .unwrap_or(0),
             message: error
                 .get("message")
                 .and_then(Value::as_str)
@@ -464,21 +484,37 @@ mod tests {
     }
 
     #[test]
-    fn test_error_classification() {
+    fn test_error_disposition() {
         let api = |code| Error::Api {
             code,
             message: String::new(),
         };
-        assert!(api(INVALID_URL).is_permanent_for_url());
-        assert!(api(DOMAIN_OPTED_OUT).is_permanent_for_url());
-        assert!(!api(RATE_LIMIT_EXCEEDED).is_permanent_for_url());
-        assert!(api(RATE_LIMIT_EXCEEDED).is_rate_limit());
-        assert!(api(INVALID_FOLDER_ID).is_missing_folder());
-        assert!(!api(INVALID_FOLDER_ID).is_permanent_for_url());
-        let unreadable = Error::Unreadable {
-            status: 503,
+        assert_eq!(api(INVALID_URL).disposition(), Disposition::DropLink);
+        assert_eq!(api(DOMAIN_OPTED_OUT).disposition(), Disposition::DropLink);
+        assert_eq!(
+            api(RATE_LIMIT_EXCEEDED).disposition(),
+            Disposition::RateLimited
+        );
+        assert_eq!(
+            api(INVALID_FOLDER_ID).disposition(),
+            Disposition::ReconnectFolder
+        );
+        assert_eq!(api(1500).disposition(), Disposition::Retry);
+        assert_eq!(api(0).disposition(), Disposition::Retry);
+
+        let unreadable = |status| Error::Unreadable {
+            status,
             body: String::new(),
         };
-        assert!(!unreadable.is_permanent_for_url());
+        assert_eq!(unreadable(503).disposition(), Disposition::Retry);
+        assert_eq!(unreadable(401).disposition(), Disposition::ResetSession);
+        assert_eq!(
+            Error::Auth {
+                status: 401,
+                body: String::new()
+            }
+            .disposition(),
+            Disposition::ResetSession
+        );
     }
 }

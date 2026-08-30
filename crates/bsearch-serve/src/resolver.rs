@@ -68,7 +68,7 @@ impl Resolver {
             match self.agent.api.app.bsky.feed.get_posts(params.into()).await {
                 Ok(output) => {
                     for view in &output.posts {
-                        if let Some(post) = post_view_to_post(view, Source::Like) {
+                        if let Some(post) = resolve_post_view(view, Source::Like) {
                             posts.push(post);
                         }
                     }
@@ -87,7 +87,7 @@ impl Resolver {
 ///
 /// `record` is an untyped `Unknown`, so the text, timestamp and links are
 /// read out of its JSON representation rather than a generated struct.
-fn post_view_to_post(view: &PostView, source: Source) -> Option<ResolvedPost> {
+fn resolve_post_view(view: &PostView, source: Source) -> Option<ResolvedPost> {
     let record = serde_json::to_value(&view.record).ok()?;
     let text = record.get("text")?.as_str()?;
     if text.is_empty() {
