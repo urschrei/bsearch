@@ -1,17 +1,26 @@
 use anyhow::Context;
 use anyhow::Result;
-use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::agent::atp_agent::AtpAgent;
+use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::app::bsky::feed::defs::PostView;
 use atrium_xrpc_client::reqwest::ReqwestClient;
-use bsearch_core::models::parse_created_at;
 use bsearch_core::models::Post;
 use bsearch_core::models::Source;
+use bsearch_core::models::parse_created_at;
 
 use crate::config::Config;
+use crate::links::Link;
+use crate::links::extract_links;
 
 /// The AT Protocol caps `getPosts` at 25 URIs per call.
 pub const MAX_URIS_PER_CALL: usize = 25;
+
+/// A liked post together with the web links it carries.
+#[derive(Debug, Clone)]
+pub struct ResolvedPost {
+    pub post: Post,
+    pub links: Vec<Link>,
+}
 
 /// AT Protocol client for turning liked-post references into full posts.
 ///
@@ -50,7 +59,7 @@ impl Resolver {
     ///
     /// A failing chunk is logged and skipped rather than aborting the batch,
     /// matching the Python behaviour; the caller re-queues on a hard error.
-    pub async fn resolve_post_uris(&self, uris: &[String]) -> Result<Vec<Post>> {
+    pub async fn resolve_post_uris(&self, uris: &[String]) -> Result<Vec<ResolvedPost>> {
         let mut posts = Vec::new();
         for chunk in uris.chunks(MAX_URIS_PER_CALL) {
             let params = atrium_api::app::bsky::feed::get_posts::ParametersData {
@@ -73,12 +82,12 @@ impl Resolver {
     }
 }
 
-/// Convert an AT Protocol `PostView` into our `Post`, or `None` when the
-/// record carries no text (the Python code skips those too).
+/// Convert an AT Protocol `PostView` into our `Post` plus its links, or
+/// `None` when the record carries no text (the Python code skips those too).
 ///
-/// `record` is an untyped `Unknown`, so the text and timestamp are read out of
-/// its JSON representation rather than a generated struct.
-fn post_view_to_post(view: &PostView, source: Source) -> Option<Post> {
+/// `record` is an untyped `Unknown`, so the text, timestamp and links are
+/// read out of its JSON representation rather than a generated struct.
+fn post_view_to_post(view: &PostView, source: Source) -> Option<ResolvedPost> {
     let record = serde_json::to_value(&view.record).ok()?;
     let text = record.get("text")?.as_str()?;
     if text.is_empty() {
@@ -87,7 +96,7 @@ fn post_view_to_post(view: &PostView, source: Source) -> Option<Post> {
 
     let created_at = parse_created_at(record.get("createdAt").and_then(|v| v.as_str()));
 
-    Some(Post::new(
+    let post = Post::new(
         view.uri.clone(),
         view.cid.as_ref().to_string(),
         view.author.did.as_str().to_string(),
@@ -95,5 +104,9 @@ fn post_view_to_post(view: &PostView, source: Source) -> Option<Post> {
         text.to_string(),
         created_at,
         source,
-    ))
+    );
+    Some(ResolvedPost {
+        post,
+        links: extract_links(&record),
+    })
 }

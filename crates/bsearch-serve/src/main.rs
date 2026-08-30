@@ -1,5 +1,6 @@
 mod config;
 mod jetstream;
+mod links;
 mod resolver;
 
 use std::process::Command;
@@ -220,7 +221,8 @@ async fn resolve_likes_loop(
         match resolver.resolve_post_uris(&uris).await {
             Ok(posts) => {
                 let db = db.lock().await;
-                for post in &posts {
+                for resolved in &posts {
+                    let post = &resolved.post;
                     match db.insert_post(post) {
                         Ok(Some(_)) => tracing::info!(uri = %post.uri, "Indexed liked post"),
                         Ok(None) => {}
