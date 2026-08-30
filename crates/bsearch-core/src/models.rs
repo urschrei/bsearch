@@ -68,6 +68,20 @@ impl Post {
     }
 }
 
+/// A link found in a liked post, waiting to be sent to the read-later
+/// service. Stored in `pending_links`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLink {
+    pub url: String,
+    /// The post the link was found in.
+    pub post_uri: String,
+    /// The page title, when the post's link card supplied one. Left to the
+    /// service to look up otherwise.
+    pub title: Option<String>,
+    /// Shown alongside the bookmark: the author and text of the post.
+    pub description: String,
+}
+
 /// Format a timezone-aware timestamp the way Python's `datetime.isoformat()`
 /// does, e.g. `2026-03-29T03:11:21.467000+00:00`.
 ///

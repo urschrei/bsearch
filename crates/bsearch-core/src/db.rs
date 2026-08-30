@@ -12,9 +12,10 @@ use rusqlite::OptionalExtension;
 
 use chrono::Local;
 
+use crate::models::PendingLink;
+use crate::models::Post;
 use crate::models::created_at_sort_key;
 use crate::models::format_indexed_at;
-use crate::models::Post;
 
 /// Schema statements, kept byte-for-byte in step with `src/bsearch/db.py`.
 /// Both the daemon and the Python CLI may be the first to touch a fresh
@@ -43,6 +44,14 @@ CREATE INDEX IF NOT EXISTS idx_posts_has_embedding ON posts(has_embedding);
 
 CREATE TABLE IF NOT EXISTS pending_likes (
     uri TEXT PRIMARY KEY,
+    queued_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_links (
+    url TEXT PRIMARY KEY,
+    post_uri TEXT NOT NULL,
+    title TEXT,
+    description TEXT NOT NULL,
     queued_at TEXT NOT NULL
 );
 ";
@@ -146,6 +155,30 @@ pub struct Database {
     conn: Connection,
 }
 
+/// Insert a post through `conn`, which may be a transaction.
+fn insert_post_on(conn: &Connection, post: &Post) -> Result<Option<i64>> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO posts
+             (uri, cid, author_did, author_handle, text, created_at, source, indexed_at, has_embedding)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+        rusqlite::params![
+            post.uri,
+            post.cid,
+            post.author_did,
+            post.author_handle,
+            post.text,
+            post.created_at,
+            post.source,
+            post.indexed_at,
+        ],
+    )?;
+
+    if changed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(conn.last_insert_rowid()))
+}
+
 impl Database {
     /// Open the database read-only, for search.
     pub fn open(path: &Path) -> Result<Self> {
@@ -231,26 +264,79 @@ impl Database {
     /// The FTS index is maintained by the `posts_ai` trigger, so no separate
     /// write is needed here.
     pub fn insert_post(&self, post: &Post) -> Result<Option<i64>> {
-        let changed = self.conn.execute(
-            "INSERT OR IGNORE INTO posts
-                 (uri, cid, author_did, author_handle, text, created_at, source, indexed_at, has_embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
-            rusqlite::params![
-                post.uri,
-                post.cid,
-                post.author_did,
-                post.author_handle,
-                post.text,
-                post.created_at,
-                post.source,
-                post.indexed_at,
-            ],
-        )?;
+        insert_post_on(&self.conn, post)
+    }
 
-        if changed == 0 {
-            return Ok(None);
+    /// Insert a post and, if it was new, queue the links it carries for
+    /// submission to the read-later service.
+    ///
+    /// Both writes happen in one transaction. Done separately, a crash in
+    /// between would leave the post indexed and its links lost for good:
+    /// the like is resolved again on restart, but the post already exists
+    /// by then, so nothing would queue the links a second time. Links of a
+    /// post already present are not queued at all, so a replayed like does
+    /// not resubmit them.
+    pub fn insert_post_with_links(
+        &self,
+        post: &Post,
+        links: &[PendingLink],
+    ) -> Result<Option<i64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = insert_post_on(&tx, post)?;
+        if inserted.is_some() {
+            let queued_at = format_indexed_at(Local::now().naive_local());
+            for link in links {
+                tx.execute(
+                    "INSERT OR IGNORE INTO pending_links
+                         (url, post_uri, title, description, queued_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        link.url,
+                        link.post_uri,
+                        link.title,
+                        link.description,
+                        queued_at,
+                    ],
+                )?;
+            }
         }
-        Ok(Some(self.conn.last_insert_rowid()))
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// The oldest queued links, in the order they arrived.
+    ///
+    /// Read rather than removed, like [`Self::take_pending_likes`]; call
+    /// [`Self::remove_pending_link`] once a link has been dealt with.
+    pub fn take_pending_links(&self, limit: usize) -> Result<Vec<PendingLink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT url, post_uri, title, description
+             FROM pending_links ORDER BY rowid LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(PendingLink {
+                url: row.get(0)?,
+                post_uri: row.get(1)?,
+                title: row.get(2)?,
+                description: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Drop a queued link, whether it was submitted or given up on.
+    pub fn remove_pending_link(&self, url: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_links WHERE url = ?1", [url])?;
+        Ok(())
+    }
+
+    /// How many links are waiting to be submitted.
+    pub fn count_pending_links(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT count(*) FROM pending_links", [], |row| row.get(0))
+            .map_err(Into::into)
     }
 
     /// Return `(id, text)` for posts that still need an embedding.
@@ -1134,6 +1220,7 @@ mod tests {
             "index idx_posts_source",
             "index sqlite_autoindex_meta_1",
             "index sqlite_autoindex_pending_likes_1",
+            "index sqlite_autoindex_pending_links_1",
             "index sqlite_autoindex_posts_1",
             "index sqlite_autoindex_vec_posts_info_1",
             "index sqlite_autoindex_vec_posts_vector_chunks00_1",
@@ -1144,6 +1231,7 @@ mod tests {
             "table fts_posts_idx",
             "table meta",
             "table pending_likes",
+            "table pending_links",
             "table posts",
             "table sqlite_sequence",
             "table vec_posts",
@@ -1316,6 +1404,106 @@ mod tests {
         db.remove_pending_likes(&["at://never-queued".to_string()])
             .expect("removing an absent uri should be a no-op");
         assert_eq!(db.count_pending_likes().expect("count failed"), 0);
+    }
+
+    fn sample_link(url: &str) -> PendingLink {
+        PendingLink {
+            url: url.to_string(),
+            post_uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+            title: Some("A page".to_string()),
+            description: "alice.bsky.social: worth a read".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_insert_post_with_links_queues_links_of_a_new_post() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let links = [
+            sample_link("https://a.example/1"),
+            sample_link("https://a.example/2"),
+        ];
+
+        let inserted = db
+            .insert_post_with_links(&sample_post("at://uri/1", "text"), &links)
+            .expect("insert failed");
+
+        assert!(inserted.is_some());
+        let queued = db.take_pending_links(10).expect("read failed");
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].url, "https://a.example/1");
+        assert_eq!(queued[0].post_uri, links[0].post_uri);
+        assert_eq!(queued[0].title.as_deref(), Some("A page"));
+        assert_eq!(queued[0].description, links[0].description);
+    }
+
+    #[test]
+    fn test_insert_post_with_links_skips_links_of_an_existing_post() {
+        // A replayed like resolves to a post already indexed; its links
+        // were queued the first time and must not be submitted again.
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let post = sample_post("at://uri/1", "text");
+        db.insert_post(&post).expect("insert failed");
+
+        let inserted = db
+            .insert_post_with_links(&post, &[sample_link("https://a.example/1")])
+            .expect("insert failed");
+
+        assert!(inserted.is_none());
+        assert_eq!(db.count_pending_links().expect("count failed"), 0);
+    }
+
+    #[test]
+    fn test_pending_links_ignore_duplicate_urls() {
+        // Two liked posts can share a link; the second is absorbed while
+        // the first is still queued.
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let link = [sample_link("https://a.example/1")];
+        db.insert_post_with_links(&sample_post("at://uri/1", "text"), &link)
+            .expect("insert failed");
+        db.insert_post_with_links(&sample_post("at://uri/2", "text"), &link)
+            .expect("insert failed");
+
+        assert_eq!(db.count_pending_links().expect("count failed"), 1);
+    }
+
+    #[test]
+    fn test_take_pending_links_does_not_consume() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.insert_post_with_links(
+            &sample_post("at://uri/1", "text"),
+            &[sample_link("https://a.example/1")],
+        )
+        .expect("insert failed");
+
+        assert_eq!(db.take_pending_links(10).expect("read failed").len(), 1);
+        assert_eq!(db.take_pending_links(10).expect("read failed").len(), 1);
+    }
+
+    #[test]
+    fn test_remove_pending_link_drops_only_the_named() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.insert_post_with_links(
+            &sample_post("at://uri/1", "text"),
+            &[
+                sample_link("https://a.example/1"),
+                sample_link("https://a.example/2"),
+            ],
+        )
+        .expect("insert failed");
+
+        db.remove_pending_link("https://a.example/1")
+            .expect("remove failed");
+        db.remove_pending_link("https://never-queued.example/")
+            .expect("removing an absent url should be a no-op");
+
+        let remaining = db.take_pending_links(10).expect("read failed");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].url, "https://a.example/2");
     }
 
     #[test]

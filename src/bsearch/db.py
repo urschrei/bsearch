@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS pending_likes (
     uri TEXT PRIMARY KEY,
     queued_at TEXT NOT NULL
 );
+
+-- Links found in liked posts, awaiting submission to Instapaper. Filled and
+-- drained by the Rust daemon; declared here for the same reason as above.
+CREATE TABLE IF NOT EXISTS pending_links (
+    url TEXT PRIMARY KEY,
+    post_uri TEXT NOT NULL,
+    title TEXT,
+    description TEXT NOT NULL,
+    queued_at TEXT NOT NULL
+);
 """
 
 VEC_TABLE_SQL = """
