@@ -1,4 +1,5 @@
 mod config;
+mod instapaper;
 mod jetstream;
 mod links;
 mod resolver;
