@@ -15,15 +15,15 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 
-use super::events::record_cid;
-use super::events::record_json;
 use super::events::Commit;
 use super::events::Event;
 use super::events::Payload;
+use super::events::record_cid;
+use super::events::record_json;
 
 pub const RESERVED_HEADER_BYTES: u64 = 256;
 const SEGMENT_MAGIC: &[u8; 4] = b"jss0";

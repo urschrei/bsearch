@@ -9,21 +9,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use bsearch_core::db::Database;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::archive::ArchiveError;
 use super::archive::HttpArchive;
-use super::events::classify_cursor;
 use super::events::Frame;
 use super::events::StoredCursor;
-use super::ingest::IngestHandler;
+use super::events::classify_cursor;
 use super::ingest::COLLECTION_LIKE;
 use super::ingest::COLLECTION_POST;
+use super::ingest::IngestHandler;
 use super::live;
 use super::live::ConnectError;
 use super::live::LiveParams;

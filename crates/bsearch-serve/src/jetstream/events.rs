@@ -219,8 +219,8 @@ pub fn record_json(dag_cbor: &[u8]) -> Result<serde_json::Value> {
 }
 
 fn ipld_to_json(ipld: Ipld) -> serde_json::Value {
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
     match ipld {
         Ipld::Null => Value::Null,
         Ipld::Bool(b) => Value::Bool(b),

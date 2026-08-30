@@ -7,16 +7,16 @@
 use anyhow::Result;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use http::Uri;
 use http::header::HeaderValue;
 use http::header::SEC_WEBSOCKET_PROTOCOL;
 use http::header::USER_AGENT;
-use http::Uri;
 use tokio_websockets::ClientBuilder;
 use tokio_websockets::MaybeTlsStream;
 use tokio_websockets::WebSocketStream;
 
-use super::events::decode_frame;
 use super::events::Frame;
+use super::events::decode_frame;
 
 /// What to subscribe to. `cursor` is inclusive; it may be a seq or, at or
 /// above 1e15, a unix-microsecond timestamp the server translates. `None`

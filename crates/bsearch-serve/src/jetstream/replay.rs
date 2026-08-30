@@ -7,16 +7,16 @@
 //! idempotent, and the driver additionally skips rows at or below its
 //! floor, so overlap at every boundary is absorbed.
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use tokio_util::sync::CancellationToken;
 
-use super::archive::next_delay;
 use super::archive::ArchiveError;
 use super::archive::Fetcher;
 use super::archive::PlanSegment;
 use super::archive::SnapshotRequest;
+use super::archive::next_delay;
 use super::events::Event;
 use super::jss;
 use super::jss::RawEvent;
@@ -323,9 +323,9 @@ mod tests {
     use crate::jetstream::archive::BlockRange;
     use crate::jetstream::archive::PlanStats;
     use crate::jetstream::archive::SnapshotPlan;
-    use crate::jetstream::jss::tests::compress_block;
     use crate::jetstream::jss::KIND_CREATE;
     use crate::jetstream::jss::KIND_IDENTITY;
+    use crate::jetstream::jss::tests::compress_block;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::PathBuf;

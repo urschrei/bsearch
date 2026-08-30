@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bsearch_core::db::Database;
-use bsearch_core::models::parse_created_at;
 use bsearch_core::models::Post;
 use bsearch_core::models::Source;
+use bsearch_core::models::parse_created_at;
 use tokio::sync::Mutex;
 
 use super::events::Event;
@@ -396,10 +396,11 @@ mod tests {
         h.handler.handle_event(&event).await.expect("handle failed");
 
         let db = h.db.lock().await;
-        assert!(db
-            .get_posts_without_embeddings(10)
-            .expect("query")
-            .is_empty());
+        assert!(
+            db.get_posts_without_embeddings(10)
+                .expect("query")
+                .is_empty()
+        );
         assert_eq!(
             db.get_cursor().expect("cursor"),
             Some(4_242),
@@ -419,10 +420,11 @@ mod tests {
         h.handler.handle_event(&event).await.expect("handle failed");
 
         let db = h.db.lock().await;
-        assert!(db
-            .get_posts_without_embeddings(10)
-            .expect("query")
-            .is_empty());
+        assert!(
+            db.get_posts_without_embeddings(10)
+                .expect("query")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
