@@ -43,7 +43,30 @@ pub struct Config {
     /// dropped. Reloading costs well under a second, and holding the session
     /// open is the difference between roughly 20 MB and 90 MB resident.
     pub embedder_idle_timeout: u64,
+    /// Instapaper credentials, present only when the `.env` configures them.
+    /// Without them, links in liked posts are not collected.
+    pub instapaper: Option<InstapaperConfig>,
+    pub instapaper_batch_interval: u64,
 }
+
+/// What the daemon needs to file links in an Instapaper folder.
+///
+/// The Full API is the only one that can target a folder, and it signs every
+/// request with an OAuth consumer key that Instapaper issues on request. The
+/// access token itself is obtained at run time from the username and password
+/// (xAuth) and never stored.
+#[derive(Debug, Clone)]
+pub struct InstapaperConfig {
+    pub consumer_key: String,
+    pub consumer_secret: String,
+    pub username: String,
+    /// Instapaper accounts need not have a password, so empty is accepted.
+    pub password: String,
+    /// Title of the folder the links go into; created if it does not exist.
+    pub folder: String,
+}
+
+const DEFAULT_INSTAPAPER_FOLDER: &str = "bluesky-likes";
 
 const DEFAULT_JETSTREAM_HOSTNAME: &str = "jetstream.us-east.bsky.network";
 const DEFAULT_PDS_URL: &str = "https://bsky.social";
@@ -86,6 +109,7 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_JETSTREAM_HOSTNAME.to_string());
 
         let jetstream_key = lookup(&file_values, &["BSEARCH_JETSTREAM_KEY", "jetstream_key"]);
+        let instapaper = instapaper_config(&file_values)?;
 
         Ok(Self {
             handle,
@@ -103,8 +127,68 @@ impl Config {
             // seven minutes anyway, so recycling at five keeps us ahead of it.
             max_connection_seconds: 300,
             embedder_idle_timeout: 300,
+            instapaper,
+            instapaper_batch_interval: 5,
         })
     }
+}
+
+/// Read the Instapaper settings, or `None` when none of them is set.
+///
+/// Setting some of them but not all is treated as an error rather than as
+/// "off", so that a typo in one key does not silently disable the feature.
+fn instapaper_config(file_values: &HashMap<String, String>) -> Result<Option<InstapaperConfig>> {
+    let consumer_key = lookup(
+        file_values,
+        &["BSEARCH_INSTAPAPER_CONSUMER_KEY", "instapaper_consumer_key"],
+    );
+    let consumer_secret = lookup(
+        file_values,
+        &[
+            "BSEARCH_INSTAPAPER_CONSUMER_SECRET",
+            "instapaper_consumer_secret",
+        ],
+    );
+    let username = lookup(
+        file_values,
+        &["BSEARCH_INSTAPAPER_USERNAME", "instapaper_username"],
+    );
+    let password = lookup(
+        file_values,
+        &["BSEARCH_INSTAPAPER_PASSWORD", "instapaper_password"],
+    );
+    let folder = lookup(
+        file_values,
+        &["BSEARCH_INSTAPAPER_FOLDER", "instapaper_folder"],
+    );
+
+    let required = [
+        ("instapaper_consumer_key", &consumer_key),
+        ("instapaper_consumer_secret", &consumer_secret),
+        ("instapaper_username", &username),
+    ];
+    if required.iter().all(|(_, value)| value.is_none()) && password.is_none() && folder.is_none() {
+        return Ok(None);
+    }
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| *name)
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Incomplete Instapaper configuration in .env: missing {}",
+            missing.join(", ")
+        );
+    }
+
+    Ok(Some(InstapaperConfig {
+        consumer_key: consumer_key.expect("checked above"),
+        consumer_secret: consumer_secret.expect("checked above"),
+        username: username.expect("checked above"),
+        password: password.unwrap_or_default(),
+        folder: folder.unwrap_or_else(|| DEFAULT_INSTAPAPER_FOLDER.to_string()),
+    }))
 }
 
 /// Look a key up in the environment first, then in the parsed `.env` values.
@@ -209,6 +293,60 @@ mod tests {
         assert_eq!(
             lookup(&values, &["BSEARCH_JETSTREAM_KEY", "jetstream_key"]),
             Some("gk_abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_instapaper_absent_is_none() {
+        let file = write_env("user=alice\n");
+        let values = parse_env_file(file.path());
+        assert!(instapaper_config(&values).expect("no error").is_none());
+    }
+
+    #[test]
+    fn test_instapaper_full_config_uses_default_folder() {
+        let file = write_env(
+            "instapaper_consumer_key: ck\n\
+             instapaper_consumer_secret: cs\n\
+             instapaper_username: alice@example.com\n\
+             instapaper_password: hunter2\n",
+        );
+        let values = parse_env_file(file.path());
+        let cfg = instapaper_config(&values)
+            .expect("no error")
+            .expect("configured");
+        assert_eq!(cfg.consumer_key, "ck");
+        assert_eq!(cfg.consumer_secret, "cs");
+        assert_eq!(cfg.username, "alice@example.com");
+        assert_eq!(cfg.password, "hunter2");
+        assert_eq!(cfg.folder, DEFAULT_INSTAPAPER_FOLDER);
+    }
+
+    #[test]
+    fn test_instapaper_password_is_optional_and_folder_overridable() {
+        // Instapaper accounts can have no password at all.
+        let file = write_env(
+            "instapaper_consumer_key=ck\n\
+             instapaper_consumer_secret=cs\n\
+             instapaper_username=alice\n\
+             instapaper_folder=reading\n",
+        );
+        let values = parse_env_file(file.path());
+        let cfg = instapaper_config(&values)
+            .expect("no error")
+            .expect("configured");
+        assert_eq!(cfg.password, "");
+        assert_eq!(cfg.folder, "reading");
+    }
+
+    #[test]
+    fn test_instapaper_partial_config_is_an_error() {
+        let file = write_env("instapaper_consumer_key=ck\ninstapaper_username=alice\n");
+        let values = parse_env_file(file.path());
+        let err = instapaper_config(&values).expect_err("incomplete config must fail");
+        assert!(
+            err.to_string().contains("instapaper_consumer_secret"),
+            "error should name the missing key: {err}"
         );
     }
 
