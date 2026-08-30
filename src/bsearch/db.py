@@ -212,12 +212,20 @@ class Database:
             "SELECT source, COUNT(*) AS c FROM posts GROUP BY source"
         ).fetchall():
             by_source[row["source"]] = row["c"]
+        pending_likes = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM pending_likes"
+        ).fetchone()["c"]
+        pending_links = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM pending_links"
+        ).fetchone()["c"]
         cursor = self.get_cursor()
         return {
             "total_posts": total,
             "with_embeddings": with_embeddings,
             "without_embeddings": total - with_embeddings,
             "by_source": by_source,
+            "pending_likes": pending_likes,
+            "pending_links": pending_links,
             "cursor": cursor,
         }
 

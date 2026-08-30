@@ -8,6 +8,7 @@ A local tool that monitors a Bluesky account via [Jetstream](https://github.com/
 - With a Jetstream API key, gaps are closed from Jetstream's sealed archive over HTTP: on first start the daemon replays the account's full history, and after downtime it replays exactly the missed span before rejoining the live tail
 - Own posts arrive directly in the event stream with full text
 - Likes arrive as references only -- the liked post's text is resolved in batches via the AT Protocol API
+- With Instapaper credentials configured, the links a liked post carries -- its link facets and link card -- are filed in an Instapaper folder
 - Post text is embedded with `all-MiniLM-L6-v2` (384 dimensions) and stored in a `sqlite-vec` virtual table for KNN vector search
 - Embeddings are generated periodically in the background, not blocking the event stream
 - Both the background daemon (`bsearch-serve`) and search (`bsearch-search`) are Rust binaries running the model through ONNX Runtime, statically linked so they have no runtime dependencies
@@ -65,6 +66,25 @@ The key is used only on the archive HTTP endpoints; the live WebSocket is
 unauthenticated. Without a key the daemon still follows the live tail, but
 events that fall outside the live replay buffer while it is offline are
 lost.
+
+To file the links in posts you like into an Instapaper folder, add:
+
+```
+instapaper_consumer_key=your-consumer-key
+instapaper_consumer_secret=your-consumer-secret
+instapaper_username=you@example.com
+instapaper_password=your-instapaper-password
+instapaper_folder=bluesky-likes
+```
+
+Folders are reachable only through Instapaper's Full API, which signs each
+request with an OAuth consumer key. Request one at
+<https://www.instapaper.com/developers/applications/create>; Instapaper
+reviews requests by hand before activating the key. `instapaper_password`
+may be omitted if the account has no password, and `instapaper_folder`
+defaults to `bluesky-likes`. The folder is created on first use if it does
+not exist. Setting some of these keys but not all is an error, so a typo
+cannot silently switch the feature off.
 
 ### 3. Verify authentication
 
@@ -199,6 +219,23 @@ If the live server rejects the cursor as older than its retention floor,
 the daemon re-enters archive catch-up and reconnects at the new tip; with
 no key configured it notifies, forgets the cursor, and resumes from the
 live tip, since nothing can serve the gap.
+
+With Instapaper configured, each liked post the daemon indexes for the
+first time has its links -- `app.bsky.richtext.facet#link` facets and
+`app.bsky.embed.external` cards, not URLs scanned out of the text -- written
+to a `pending_links` queue in the same transaction as the post. A separate
+task drains that queue, submitting one link a second in batches of ten, with
+the card's title if it has one and the post's author and text as the
+bookmark description. Posts that were already indexed, by an earlier run or
+by `bsearch backfill`, are not submitted. A link is removed from the queue
+only once Instapaper has accepted it, so a network failure or a restart
+leaves it to be sent later; resending is harmless, as Instapaper treats a
+URL it already holds as an update. A link Instapaper rejects outright -- an
+invalid URL, or a publisher that has opted out -- is dropped with a warning
+in the log. After any other failure the task waits a minute before trying
+again, and five minutes after a rate-limit response. Failing to connect to
+Instapaper at all raises one macOS notification and is otherwise logged.
+`bsearch status` shows how many links are waiting.
 
 Stop the daemon before running `bsearch backfill` or `bsearch reindex`.
 They generate embeddings for posts with `has_embedding = 0`, and run

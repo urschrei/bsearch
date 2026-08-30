@@ -150,6 +150,9 @@ def status():
         for source_name, count in sorted(stats["by_source"].items()):
             click.echo(f"  {source_name}: {count}")
 
+    click.echo(f"Likes awaiting resolution:      {stats['pending_likes']}")
+    click.echo(f"Links awaiting Instapaper:      {stats['pending_links']}")
+
     if stats["cursor"] is not None:
         from datetime import datetime
 
