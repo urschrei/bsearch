@@ -299,7 +299,7 @@ def export_model(output_dir: str | None):
 
 @cli.command("install-service")
 def install_service():
-    """Generate and load a launchd plist for background operation."""
+    """Install launchd agents for background operation and log rotation."""
     from bsearch.launchd import install_plist
 
     install_plist()
@@ -307,7 +307,7 @@ def install_service():
 
 @cli.command("uninstall-service")
 def uninstall_service():
-    """Unload and remove the launchd plist."""
+    """Unload and remove the launchd agents."""
     from bsearch.launchd import uninstall_plist
 
     uninstall_plist()

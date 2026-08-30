@@ -136,7 +136,9 @@ uv run bsearch install-service
 ```
 
 `install-service` writes a launchd agent pointing at
-`target/release/bsearch-serve`, so build it first.
+`target/release/bsearch-serve`, so build it first. It also installs a
+second agent that rotates the service logs daily; see
+[Log rotation](#log-rotation).
 
 ## Commands
 
@@ -151,8 +153,8 @@ uv run bsearch install-service
 | `uv run bsearch reindex [--batch-size N]` | Clear all embeddings and regenerate from scratch |
 | `uv run bsearch vacuum` | Reclaim unused database space |
 | `uv run bsearch export-model` | Export the embedding model to ONNX format |
-| `uv run bsearch install-service` | Install and start a launchd agent for background operation |
-| `uv run bsearch uninstall-service` | Stop and remove the launchd agent |
+| `uv run bsearch install-service` | Install and start launchd agents for background operation and log rotation |
+| `uv run bsearch uninstall-service` | Stop and remove the launchd agents |
 
 Use `-v` before any subcommand for verbose logging, e.g. `uv run bsearch -v backfill`.
 
@@ -261,70 +263,14 @@ renamed file until its next restart. The descriptors are append-mode,
 though, so copy-then-truncate is safe -- the daemon's next write lands at
 the start of the emptied file and nothing is lost, with no restart needed.
 
-Rotation is a short script, run daily by a second launchd agent. The
-script, installed at `~/.local/bin/bsearch-logrotate`:
-
-```sh
-#!/bin/sh
-# Rotate the bsearch logs that launchd writes.
-# launchd opens these files with O_APPEND, so it is safe to copy the
-# file and then truncate it in place: the server does not lose its
-# file descriptor and subsequent writes go to the start of the file.
-LOGDIR="$HOME/Library/Logs/bsearch"
-KEEP=7
-
-for name in stdout stderr; do
-    f="$LOGDIR/$name.log"
-    # Skip files that are missing or empty.
-    [ -s "$f" ] || continue
-    ts=$(date +%Y%m%d-%H%M%S)
-    cp "$f" "$f.$ts" && : > "$f" && gzip "$f.$ts"
-    # Remove archives beyond the newest KEEP.
-    ls -t "$LOGDIR/$name.log."*.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r old; do
-        rm -- "$old"
-    done
-done
-```
-
-The agent, at `~/Library/LaunchAgents/social.bsky.bsearch.logrotate.plist`,
-runs it at 03:15 each day; launchd runs a missed calendar job once on wake,
-so rotation still happens on a machine that sleeps overnight:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>social.bsky.bsearch.logrotate</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/you/.local/bin/bsearch-logrotate</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>3</integer>
-        <key>Minute</key>
-        <integer>15</integer>
-    </dict>
-</dict>
-</plist>
-```
-
-Load it with:
-
-```
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/social.bsky.bsearch.logrotate.plist
-```
-
-`KEEP` in the script sets how many gzipped archives are retained per log.
-To remove the agent again:
-
-```
-launchctl bootout gui/$(id -u)/social.bsky.bsearch.logrotate
-```
+Rotation is `scripts/bsearch-logrotate`, run daily at 03:15 by the
+`social.bsky.bsearch.logrotate` launchd agent that `install-service` sets
+up alongside the daemon. Each run copies a non-empty log to a timestamped
+file, truncates the original in place, gzips the copy, and keeps the
+newest seven archives per log (`KEEP` in the script). launchd runs a
+missed calendar job once on wake, so rotation still happens on a machine
+that sleeps overnight. `uninstall-service` removes the rotation agent
+together with the daemon's.
 
 ## Storage
 

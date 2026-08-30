@@ -8,8 +8,10 @@ from textwrap import dedent
 import click
 
 LABEL = "social.bsky.bsearch"
+ROTATE_LABEL = f"{LABEL}.logrotate"
 PLIST_DIR = Path.home() / "Library" / "LaunchAgents"
 PLIST_PATH = PLIST_DIR / f"{LABEL}.plist"
+ROTATE_PLIST_PATH = PLIST_DIR / f"{ROTATE_LABEL}.plist"
 LOG_DIR = Path.home() / "Library" / "Logs" / "bsearch"
 
 
@@ -67,8 +69,54 @@ def _generate_plist(executable: str, working_dir: str) -> str:
     """)
 
 
+def _generate_rotate_plist(script: str) -> str:
+    """Generate the launchd plist XML for the log rotation agent.
+
+    The daemon holds append-mode descriptors to its log files for as long
+    as it runs, so the script rotates by copy-then-truncate rather than
+    rename. A calendar job missed while the machine sleeps runs once on
+    wake.
+    """
+    return dedent(f"""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>{ROTATE_LABEL}</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>{script}</string>
+            </array>
+            <key>StartCalendarInterval</key>
+            <dict>
+                <key>Hour</key>
+                <integer>3</integer>
+                <key>Minute</key>
+                <integer>15</integer>
+            </dict>
+        </dict>
+        </plist>
+    """)
+
+
+def _load(path: Path, label: str) -> None:
+    """Load a plist, reporting failure as a warning."""
+    result = subprocess.run(
+        ["launchctl", "load", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        click.echo(f"Warning: launchctl load returned: {result.stderr}", err=True)
+    else:
+        click.echo(f"Service loaded: {label}")
+
+
 def install_plist() -> None:
-    """Generate and install the launchd plist."""
+    """Generate and install the launchd plists for the daemon and log rotation."""
     try:
         executable = _find_bsearch_executable()
     except FileNotFoundError as e:
@@ -83,34 +131,37 @@ def install_plist() -> None:
     plist_content = _generate_plist(executable, working_dir)
     PLIST_PATH.write_text(plist_content)
     click.echo(f"Wrote plist to {PLIST_PATH}")
+    _load(PLIST_PATH, LABEL)
+    click.echo(f"Logs: {LOG_DIR}")
 
-    # Load the plist
-    result = subprocess.run(
-        ["launchctl", "load", str(PLIST_PATH)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        click.echo(f"Warning: launchctl load returned: {result.stderr}", err=True)
-    else:
-        click.echo(f"Service loaded: {LABEL}")
-        click.echo(f"Logs: {LOG_DIR}")
+    rotate_script = Path(working_dir) / "scripts" / "bsearch-logrotate"
+    if not rotate_script.exists():
+        click.echo(
+            f"Warning: {rotate_script} not found; log rotation not installed",
+            err=True,
+        )
+        return
+    ROTATE_PLIST_PATH.write_text(_generate_rotate_plist(str(rotate_script)))
+    click.echo(f"Wrote plist to {ROTATE_PLIST_PATH}")
+    _load(ROTATE_PLIST_PATH, ROTATE_LABEL)
 
 
 def uninstall_plist() -> None:
-    """Unload and remove the launchd plist."""
-    if not PLIST_PATH.exists():
-        click.echo(f"Plist not found: {PLIST_PATH}")
-        return
+    """Unload and remove the launchd plists."""
+    for path, label in ((PLIST_PATH, LABEL), (ROTATE_PLIST_PATH, ROTATE_LABEL)):
+        if not path.exists():
+            click.echo(f"Plist not found: {path}")
+            continue
 
-    result = subprocess.run(
-        ["launchctl", "unload", str(PLIST_PATH)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        click.echo(f"Warning: launchctl unload returned: {result.stderr}", err=True)
+        result = subprocess.run(
+            ["launchctl", "unload", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            click.echo(f"Warning: launchctl unload returned: {result.stderr}", err=True)
 
-    PLIST_PATH.unlink()
-    click.echo(f"Removed plist: {PLIST_PATH}")
-    click.echo(f"Service unloaded: {LABEL}")
+        path.unlink()
+        click.echo(f"Removed plist: {path}")
+        click.echo(f"Service unloaded: {label}")
