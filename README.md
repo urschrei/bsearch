@@ -70,21 +70,20 @@ lost.
 To file the links in posts you like into an Instapaper folder, add:
 
 ```
-instapaper_consumer_key=your-consumer-key
-instapaper_consumer_secret=your-consumer-secret
-instapaper_username=you@example.com
-instapaper_password=your-instapaper-password
+instapaper_access_token=your-access-token
 instapaper_folder=bluesky-likes
 ```
 
-Folders are reachable only through Instapaper's Full API, which signs each
-request with an OAuth consumer key. Request one at
-<https://www.instapaper.com/developers/applications/create>; Instapaper
-reviews requests by hand before activating the key. `instapaper_password`
-may be omitted if the account has no password, and `instapaper_folder`
-defaults to `bluesky-likes`. The folder is created on first use if it does
-not exist. Setting some of these keys but not all is an error, so a typo
-cannot silently switch the feature off.
+The daemon uses Instapaper API v2 with a personal access token. To get one,
+open your application at <https://www.instapaper.com/developers/applications>
+(create one if you have none) and select "Generate access token". Instapaper
+shows the token once; regenerating or revoking it on the same page stops the
+old one working. `instapaper_folder` defaults to `bluesky-likes`, and the
+folder is created on first use if it does not exist. Setting the folder
+without the token is an error, so a typo cannot silently switch the feature
+off. The API v1 keys (`instapaper_consumer_key`,
+`instapaper_consumer_secret`, `instapaper_username`, `instapaper_password`)
+are no longer read, and the daemon does not start while any of them is set.
 
 ### 3. Verify authentication
 
@@ -236,7 +235,9 @@ only once Instapaper has accepted it, so a network failure or a restart
 leaves it to be sent later; resending is harmless, as Instapaper treats a
 URL it already holds as an update. A link Instapaper rejects outright -- an
 invalid URL, or a publisher that has opted out -- is dropped with a warning
-in the log. After any other failure the task waits a minute before trying
+in the log. Instapaper reports these and a missing folder with the same
+status, so after a rejection the task checks that the folder still exists;
+if it does not, the task finds or creates it again and keeps the link. After any other failure the task waits a minute before trying
 again, and five minutes after a rate-limit response. Failing to connect to
 Instapaper at all raises one macOS notification and is otherwise logged.
 `bsearch status` shows how many links are waiting.
