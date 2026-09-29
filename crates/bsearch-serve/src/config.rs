@@ -51,20 +51,26 @@ pub struct Config {
 
 /// What the daemon needs to file links in an Instapaper folder.
 ///
-/// The Full API is the only one that can target a folder, and it signs every
-/// request with an OAuth consumer key that Instapaper issues on request. The
-/// access token itself is obtained at run time from the username and password
-/// (xAuth) and never stored.
+/// The access token is a personal access token, generated for the account
+/// from the application's page at
+/// <https://www.instapaper.com/developers/applications>.
 #[derive(Debug, Clone)]
 pub struct InstapaperConfig {
-    pub consumer_key: String,
-    pub consumer_secret: String,
-    pub username: String,
-    /// Instapaper accounts need not have a password, so empty is accepted.
-    pub password: String,
+    pub access_token: String,
     /// Title of the folder the links go into; created if it does not exist.
     pub folder: String,
 }
+
+/// The API v1 keys, which API v2 does not use.
+const LEGACY_INSTAPAPER_KEYS: [[&str; 2]; 4] = [
+    ["BSEARCH_INSTAPAPER_CONSUMER_KEY", "instapaper_consumer_key"],
+    [
+        "BSEARCH_INSTAPAPER_CONSUMER_SECRET",
+        "instapaper_consumer_secret",
+    ],
+    ["BSEARCH_INSTAPAPER_USERNAME", "instapaper_username"],
+    ["BSEARCH_INSTAPAPER_PASSWORD", "instapaper_password"],
+];
 
 const DEFAULT_INSTAPAPER_FOLDER: &str = "bluesky-likes";
 
@@ -135,57 +141,43 @@ impl Config {
 
 /// Read the Instapaper settings, or `None` when none of them is set.
 ///
-/// Setting some of them but not all is treated as an error rather than as
-/// "off", so that a typo in one key does not silently disable the feature.
+/// A folder without a token is treated as an error rather than as "off",
+/// so that a typo in the token key does not silently disable the feature.
+/// The API v1 keys are an error too: they held the account password, and
+/// the daemon no longer reads them.
 fn instapaper_config(file_values: &HashMap<String, String>) -> Result<Option<InstapaperConfig>> {
-    let consumer_key = lookup(
+    let legacy: Vec<&str> = LEGACY_INSTAPAPER_KEYS
+        .iter()
+        .filter(|keys| lookup(file_values, keys.as_slice()).is_some())
+        .map(|[_, alias]| *alias)
+        .collect();
+    if !legacy.is_empty() {
+        anyhow::bail!(
+            "Instapaper API v1 settings in .env: {}. Remove them, generate an access token at \
+             https://www.instapaper.com/developers/applications, and set \
+             instapaper_access_token instead.",
+            legacy.join(", ")
+        );
+    }
+
+    let access_token = lookup(
         file_values,
-        &["BSEARCH_INSTAPAPER_CONSUMER_KEY", "instapaper_consumer_key"],
-    );
-    let consumer_secret = lookup(
-        file_values,
-        &[
-            "BSEARCH_INSTAPAPER_CONSUMER_SECRET",
-            "instapaper_consumer_secret",
-        ],
-    );
-    let username = lookup(
-        file_values,
-        &["BSEARCH_INSTAPAPER_USERNAME", "instapaper_username"],
-    );
-    let password = lookup(
-        file_values,
-        &["BSEARCH_INSTAPAPER_PASSWORD", "instapaper_password"],
+        &["BSEARCH_INSTAPAPER_ACCESS_TOKEN", "instapaper_access_token"],
     );
     let folder = lookup(
         file_values,
         &["BSEARCH_INSTAPAPER_FOLDER", "instapaper_folder"],
     );
 
-    match (consumer_key, consumer_secret, username) {
-        (None, None, None) if password.is_none() && folder.is_none() => Ok(None),
-        (Some(consumer_key), Some(consumer_secret), Some(username)) => Ok(Some(InstapaperConfig {
-            consumer_key,
-            consumer_secret,
-            username,
-            password: password.unwrap_or_default(),
+    match (access_token, folder) {
+        (None, None) => Ok(None),
+        (Some(access_token), folder) => Ok(Some(InstapaperConfig {
+            access_token,
             folder: folder.unwrap_or_else(|| DEFAULT_INSTAPAPER_FOLDER.to_string()),
         })),
-        (consumer_key, consumer_secret, username) => {
-            let missing: Vec<&str> = [
-                ("instapaper_consumer_key", consumer_key.is_none()),
-                ("instapaper_consumer_secret", consumer_secret.is_none()),
-                ("instapaper_username", username.is_none()),
-            ]
-            .iter()
-            .filter(|(_, absent)| *absent)
-            .map(|(name, _)| *name)
-            .collect();
-            anyhow::bail!(
-                "Incomplete Instapaper configuration in .env: missing {}",
-                missing.join(", ")
-            )
-        }
+        (None, Some(_)) => anyhow::bail!(
+            "Incomplete Instapaper configuration in .env: missing instapaper_access_token"
+        ),
     }
 }
 
@@ -302,50 +294,50 @@ mod tests {
     }
 
     #[test]
-    fn test_instapaper_full_config_uses_default_folder() {
-        let file = write_env(
-            "instapaper_consumer_key: ck\n\
-             instapaper_consumer_secret: cs\n\
-             instapaper_username: alice@example.com\n\
-             instapaper_password: hunter2\n",
-        );
+    fn test_instapaper_token_alone_uses_default_folder() {
+        let file = write_env("instapaper_access_token: aabbccdd\n");
         let values = parse_env_file(file.path());
         let cfg = instapaper_config(&values)
             .expect("no error")
             .expect("configured");
-        assert_eq!(cfg.consumer_key, "ck");
-        assert_eq!(cfg.consumer_secret, "cs");
-        assert_eq!(cfg.username, "alice@example.com");
-        assert_eq!(cfg.password, "hunter2");
+        assert_eq!(cfg.access_token, "aabbccdd");
         assert_eq!(cfg.folder, DEFAULT_INSTAPAPER_FOLDER);
     }
 
     #[test]
-    fn test_instapaper_password_is_optional_and_folder_overridable() {
-        // Instapaper accounts can have no password at all.
-        let file = write_env(
-            "instapaper_consumer_key=ck\n\
-             instapaper_consumer_secret=cs\n\
-             instapaper_username=alice\n\
-             instapaper_folder=reading\n",
-        );
+    fn test_instapaper_folder_overridable() {
+        let file = write_env("instapaper_access_token=aabbccdd\ninstapaper_folder=reading\n");
         let values = parse_env_file(file.path());
         let cfg = instapaper_config(&values)
             .expect("no error")
             .expect("configured");
-        assert_eq!(cfg.password, "");
         assert_eq!(cfg.folder, "reading");
     }
 
     #[test]
-    fn test_instapaper_partial_config_is_an_error() {
-        let file = write_env("instapaper_consumer_key=ck\ninstapaper_username=alice\n");
+    fn test_instapaper_folder_without_token_is_an_error() {
+        let file = write_env("instapaper_folder=reading\n");
         let values = parse_env_file(file.path());
         let err = instapaper_config(&values).expect_err("incomplete config must fail");
         assert!(
-            err.to_string().contains("instapaper_consumer_secret"),
+            err.to_string().contains("instapaper_access_token"),
             "error should name the missing key: {err}"
         );
+    }
+
+    #[test]
+    fn test_instapaper_v1_keys_are_an_error() {
+        let file = write_env(
+            "instapaper_access_token=aabbccdd\n\
+             instapaper_consumer_key=ck\n\
+             instapaper_password=hunter2\n",
+        );
+        let values = parse_env_file(file.path());
+        let err = instapaper_config(&values).expect_err("v1 keys must fail");
+        let message = err.to_string();
+        assert!(message.contains("instapaper_consumer_key"), "{message}");
+        assert!(message.contains("instapaper_password"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
     }
 
     #[test]

@@ -337,7 +337,7 @@ const INSTAPAPER_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
 /// kept for as long as it works. It is discarded if the folder it
 /// was bound to disappears or the token stops being accepted, so that the
 /// next pass rebuilds it; and a failure to connect is reported once by
-/// notification and thereafter only logged, so a wrong password does not
+/// notification and thereafter only logged, so a revoked token does not
 /// produce a notification every minute.
 async fn instapaper_loop(
     settings: config::InstapaperConfig,
