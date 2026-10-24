@@ -17,7 +17,7 @@ rusqlite = { version = "0.40", features = ["bundled", "load_extension"] }
 sqlite-vec = "0.1"
 tokenizers = "0.23"
 dotenvy = "0.15"
-dirs = "6"
+dirs = "7"
 jiff = "0.2"
 tempfile = "3"
 serial_test = "4"
