@@ -13,7 +13,7 @@ ndarray = "0.17"
 # ONNX Runtime at build time and links it statically. This keeps the binaries
 # self-contained: no ORT_DYLIB_PATH, no Homebrew libonnxruntime at runtime.
 ort = "2.0.0-rc.13"
-rusqlite = { version = "0.40", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.41", features = ["bundled", "load_extension"] }
 sqlite-vec = "0.1"
 tokenizers = "0.23"
 dotenvy = "0.15"
