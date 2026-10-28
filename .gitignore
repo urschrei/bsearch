@@ -22,6 +22,9 @@ wheels/
 
 # Rust
 /target/
+# The workspace ships binaries, so the lockfile is tracked even where a global
+# ignore file excludes it.
+!/Cargo.lock
 
 # macOS
 .DS_Store
