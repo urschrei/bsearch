@@ -1,9 +1,11 @@
 mod backfill_links;
 mod config;
+mod image_text;
 mod images;
 mod instapaper;
 mod jetstream;
 mod links;
+mod ocr;
 mod resolver;
 
 use std::process::Command;
@@ -125,6 +127,11 @@ async fn run(mode: Option<Mode>) -> Result<()> {
         token.clone(),
     ));
     let embeddings = tokio::spawn(embedding_loop(config.clone(), db.clone(), token.clone()));
+    let image_text = tokio::spawn(image_text::run(
+        Duration::from_secs(config.image_text_batch_interval),
+        db.clone(),
+        token.clone(),
+    ));
     let instapaper = config.instapaper.as_ref().map(|settings| {
         tracing::info!(folder = %settings.folder, "Filing links from liked posts in Instapaper");
         tokio::spawn(instapaper_loop(
@@ -138,6 +145,7 @@ async fn run(mode: Option<Mode>) -> Result<()> {
     jetstream::run(&config, db, handler, token).await?;
     likes.await??;
     embeddings.await??;
+    image_text.await??;
     if let Some(instapaper) = instapaper {
         instapaper.await??;
     }

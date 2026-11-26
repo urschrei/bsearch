@@ -28,6 +28,9 @@ pub struct Config {
     pub segment_spool_dir: PathBuf,
     pub like_batch_interval: u64,
     pub embedding_batch_interval: u64,
+    /// Seconds between passes over the queue of images awaiting text
+    /// recognition.
+    pub image_text_batch_interval: u64,
     /// How long a single Jetstream connection may live before it is torn down
     /// and remade.
     ///
@@ -129,6 +132,7 @@ impl Config {
             segment_spool_dir,
             like_batch_interval: 2,
             embedding_batch_interval: 10,
+            image_text_batch_interval: 10,
             // The server was observed closing idle connections roughly every
             // seven minutes anyway, so recycling at five keeps us ahead of it.
             max_connection_seconds: 300,

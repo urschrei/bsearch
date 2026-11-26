@@ -32,6 +32,9 @@ zstd = "0.14"
 tokio-util = "0.7.19"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 clap = { version = "4", features = ["derive"] }
+objc2-vision = { version = "0.3.2", default-features = false, features = ["std", "VNRequest", "VNRecognizeTextRequest", "VNRequestHandler", "VNObservation", "VNTypes"] }
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSEnumerator", "NSError", "NSString"] }
 
 [dev-dependencies]
 tempfile.workspace = true
