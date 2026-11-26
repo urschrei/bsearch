@@ -9,6 +9,7 @@ A local tool that monitors a Bluesky account via [Jetstream](https://github.com/
 - Own posts arrive directly in the event stream with full text
 - Likes arrive as references only -- the liked post's text is resolved in batches via the AT Protocol API
 - With Instapaper credentials configured, the links a liked post carries -- its link facets and link card -- are filed in an Instapaper folder
+- Images in posts are indexed by their alt text at once, and by the text that the macOS Vision framework recognises in them shortly after
 - Post text is embedded with `all-MiniLM-L6-v2` (384 dimensions) and stored in a `sqlite-vec` virtual table for KNN vector search
 - Embeddings are generated periodically in the background, not blocking the event stream
 - Both the background daemon (`bsearch-serve`) and search (`bsearch-search`) are Rust binaries running the model through ONNX Runtime, statically linked so they have no runtime dependencies
@@ -241,6 +242,33 @@ if it does not, the task finds or creates it again and keeps the link. After any
 again, and five minutes after a rate-limit response. Failing to connect to
 Instapaper at all raises one macOS notification and is otherwise logged.
 `bsearch status` shows how many links are waiting.
+
+Images embedded in a post (`app.bsky.embed.images`, directly or inside
+`app.bsky.embed.recordWithMedia`) are written to a `post_images` queue in
+the same transaction as the post. Posts with images and no text are indexed
+too. The alt text is searchable at once. A separate task fetches each
+queued image from the Bluesky CDN, ten per pass, recognises its text with
+the Vision framework, and adds the text to the post's `image_text` column,
+which full-text search reads together with the post text. A post with
+images is embedded only after all of its images are done, from its text
+followed by its image text. An image the CDN no longer has is marked as done
+without text. Any other failure is retried on later passes, up to five
+times. When the CDN cannot be reached, or the recognition process cannot
+start, the task waits a minute without counting an attempt. Each image is read by a short-lived child
+process, `bsearch-serve recognise-text`, because Vision keeps about 140 MB of
+models in the process that uses it. After each new build, the first image
+takes about 40 seconds while Vision prepares its models.
+
+Posts indexed before images were recorded have no queued images. To record
+them, run:
+
+```
+bsearch-serve backfill-images [--since YYYY-MM-DD] [--dry-run]
+```
+
+This fetches the posts again, queues their images, and removes their
+embeddings. The running daemon then reads the images and embeds the posts
+again with their image text. It can run while the daemon is running.
 
 Stop the daemon before running `bsearch backfill` or `bsearch reindex`.
 They generate embeddings for posts with `has_embedding = 0`, and run
