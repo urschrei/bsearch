@@ -11,6 +11,8 @@ use bsearch_core::models::Source;
 use bsearch_core::models::parse_created_at;
 use tokio::sync::Mutex;
 
+use crate::images::extract_images;
+
 use super::events::Event;
 use super::events::Payload;
 use super::replay::EventSink;
@@ -40,7 +42,8 @@ impl IngestHandler {
         record: &serde_json::Value,
     ) -> Result<()> {
         let text = record.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        if text.is_empty() {
+        let images = extract_images(record);
+        if text.is_empty() && images.is_empty() {
             return Ok(());
         }
 
@@ -55,7 +58,8 @@ impl IngestHandler {
             text.to_string(),
             created_at,
             Source::OwnPost,
-        );
+        )
+        .with_images(images);
 
         let inserted = {
             let db = self.db.lock().await;
@@ -425,6 +429,40 @@ mod tests {
                 .expect("query")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_own_post_images_are_indexed_by_alt_text_and_queued() {
+        let h = harness();
+        let event = commit_event(
+            COLLECTION_POST,
+            "create",
+            serde_json::json!({
+                "text": "",
+                "createdAt": "2026-07-25T21:01:36.005Z",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{
+                        "alt": "A heron on a lamp post",
+                        "image": {"$type": "blob", "ref": {"$link": "bafkreiheron"}, "mimeType": "image/jpeg"}
+                    }]
+                }
+            }),
+        );
+
+        h.handler.handle_event(&event).await.expect("handle failed");
+
+        let db = h.db.lock().await;
+        let results = db
+            .search_fts("heron", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(results.len(), 1, "an image-only post should be indexed");
+        assert_eq!(results[0].image_text, "A heron on a lamp post");
+
+        let pending = db.take_pending_images(10).expect("queue");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].blob_cid, "bafkreiheron");
+        assert_eq!(pending[0].author_did, DID);
     }
 
     #[tokio::test]

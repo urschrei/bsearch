@@ -9,6 +9,7 @@ use bsearch_core::models::Source;
 use bsearch_core::models::parse_created_at;
 
 use crate::config::Config;
+use crate::images::extract_images;
 use crate::links::Link;
 use crate::links::extract_links;
 
@@ -83,14 +84,16 @@ impl Resolver {
 }
 
 /// Convert an AT Protocol `PostView` into our `Post` plus its links, or
-/// `None` when the record carries no text (the Python code skips those too).
+/// `None` when the record carries neither text nor images.
 ///
-/// `record` is an untyped `Unknown`, so the text, timestamp and links are
-/// read out of its JSON representation rather than a generated struct.
+/// `record` is an untyped `Unknown`, so the text, timestamp, images and
+/// links are read out of its JSON representation rather than a generated
+/// struct.
 fn resolve_post_view(view: &PostView, source: Source) -> Option<ResolvedPost> {
     let record = serde_json::to_value(&view.record).ok()?;
-    let text = record.get("text")?.as_str()?;
-    if text.is_empty() {
+    let text = record.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let images = extract_images(&record);
+    if text.is_empty() && images.is_empty() {
         return None;
     }
 
@@ -104,9 +107,58 @@ fn resolve_post_view(view: &PostView, source: Source) -> Option<ResolvedPost> {
         text.to_string(),
         created_at,
         source,
-    );
+    )
+    .with_images(images);
     Some(ResolvedPost {
         post,
         links: extract_links(&record),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsearch_core::models::PostImage;
+
+    /// A `getPosts` view as the AppView returns it, for an image-only post.
+    fn image_post_view() -> PostView {
+        serde_json::from_value(serde_json::json!({
+            "uri": "at://did:plc:author/app.bsky.feed.post/3limg",
+            "cid": "bafyreihv3ekzrewqgbnctxemlbb5fgdcyqymmhumftcyvx5yxsukp3x3wi",
+            "author": {"did": "did:plc:author", "handle": "author.bsky.social"},
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": "",
+                "createdAt": "2026-11-20T10:00:00.000Z",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{
+                        "alt": "A chart of ferret sightings",
+                        "image": {
+                            "$type": "blob",
+                            "ref": {"$link": "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy"},
+                            "mimeType": "image/jpeg",
+                            "size": 345_678
+                        }
+                    }]
+                }
+            },
+            "indexedAt": "2026-11-20T10:00:01.000Z"
+        }))
+        .expect("fixture should deserialise as a PostView")
+    }
+
+    #[test]
+    fn test_image_only_post_is_resolved_with_its_images() {
+        let resolved =
+            resolve_post_view(&image_post_view(), Source::Like).expect("post should resolve");
+        assert_eq!(resolved.post.text, "");
+        assert_eq!(
+            resolved.post.images,
+            vec![PostImage {
+                blob_cid: "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy".to_string(),
+                alt: "A chart of ferret sightings".to_string(),
+            }]
+        );
+    }
 }

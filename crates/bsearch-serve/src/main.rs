@@ -1,5 +1,6 @@
 mod backfill_links;
 mod config;
+mod images;
 mod instapaper;
 mod jetstream;
 mod links;
