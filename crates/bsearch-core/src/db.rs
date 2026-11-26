@@ -269,6 +269,16 @@ fn refresh_image_text_on(conn: &Connection, post_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The text a post is embedded from: its own text, then its image text.
+/// The embedder truncates long input, so the post text comes first.
+fn embedding_input(text: &str, image_text: &str) -> String {
+    match (text.is_empty(), image_text.is_empty()) {
+        (_, true) => text.to_string(),
+        (true, false) => image_text.to_string(),
+        (false, false) => format!("{text}\n\n{image_text}"),
+    }
+}
+
 /// Whether `table` has a column called `column`. Works for virtual tables.
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
@@ -573,12 +583,29 @@ impl Database {
         Ok(given_up)
     }
 
-    /// Return `(id, text)` for posts that still need an embedding.
+    /// Return `(id, text)` for posts that still need an embedding, where
+    /// `text` is the post text followed by its image text.
+    ///
+    /// A post with images still waiting for text recognition is left out
+    /// until they are done, so that it is embedded once, with all its text.
+    /// A post with no text of either kind is left out too: there is nothing
+    /// to embed.
     pub fn get_posts_without_embeddings(&self, limit: usize) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, text FROM posts WHERE has_embedding = 0 LIMIT ?1")?;
-        let rows = stmt.query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.text, p.image_text FROM posts p
+             WHERE p.has_embedding = 0
+               AND (p.text != '' OR p.image_text != '')
+               AND NOT EXISTS (
+                   SELECT 1 FROM post_images i
+                   WHERE i.post_id = p.id AND i.ocr_text IS NULL
+               )
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let text: String = row.get(1)?;
+            let image_text: String = row.get(2)?;
+            Ok((row.get(0)?, embedding_input(&text, &image_text)))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -1697,6 +1724,61 @@ mod tests {
         db.insert_post(&post).expect("first");
         db.insert_post(&post).expect("replay");
         assert_eq!(db.count_pending_images().expect("count"), 1);
+    }
+
+    #[test]
+    fn test_post_waits_for_image_text_before_embedding() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let post_id = db
+            .insert_post(&post_with_images("at://uri/1", "caption", &["alt"]))
+            .expect("insert failed")
+            .expect("new post");
+        assert!(
+            db.get_posts_without_embeddings(10)
+                .expect("query")
+                .is_empty(),
+            "the post must not be embedded while its image is queued"
+        );
+
+        db.store_image_text(post_id, 0, "SIGN TEXT")
+            .expect("store failed");
+        assert_eq!(
+            db.get_posts_without_embeddings(10).expect("query"),
+            vec![(post_id, "caption\n\nalt\nSIGN TEXT".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_post_without_any_text_is_not_embedded() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let post_id = db
+            .insert_post(&post_with_images("at://uri/1", "", &[""]))
+            .expect("insert failed")
+            .expect("new post");
+        db.store_image_text(post_id, 0, "").expect("store failed");
+        assert!(
+            db.get_posts_without_embeddings(10)
+                .expect("query")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_image_only_post_is_embedded_from_image_text() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let post_id = db
+            .insert_post(&post_with_images("at://uri/1", "", &[""]))
+            .expect("insert failed")
+            .expect("new post");
+        db.store_image_text(post_id, 0, "MENU")
+            .expect("store failed");
+        assert_eq!(
+            db.get_posts_without_embeddings(10).expect("query"),
+            vec![(post_id, "MENU".to_string())]
+        );
     }
 
     #[test]
