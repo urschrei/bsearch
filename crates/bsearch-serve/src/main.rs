@@ -1,3 +1,4 @@
+mod backfill_images;
 mod backfill_links;
 mod config;
 mod image_text;
@@ -36,6 +37,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Mode {
+    /// Record the images in already-indexed posts, for text recognition.
+    ///
+    /// Fetches the posts again to read their image embeds, and leaves the
+    /// images in the queue the running daemon drains. Each post with images
+    /// is embedded again once their text has been read.
+    BackfillImages {
+        /// Only posts created on or after this date (YYYY-MM-DD). All posts
+        /// when omitted.
+        #[arg(long, value_parser = parse_date)]
+        since: Option<Date>,
+        /// Fetch the posts and count their images without recording them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Queue the links in already-indexed liked posts for Instapaper.
     ///
     /// Fetches the posts again to read their link facets and cards, and
@@ -96,8 +111,14 @@ fn main() -> Result<()> {
 async fn run(mode: Option<Mode>) -> Result<()> {
     let mut config = config::Config::from_env(None)?;
 
-    if let Some(Mode::BackfillLinks { since, dry_run }) = mode {
-        return backfill_links::run(&config, since, dry_run).await;
+    match mode {
+        Some(Mode::BackfillLinks { since, dry_run }) => {
+            return backfill_links::run(&config, since, dry_run).await;
+        }
+        Some(Mode::BackfillImages { since, dry_run }) => {
+            return backfill_images::run(&config, since, dry_run).await;
+        }
+        None => {}
     }
 
     let resolver = Arc::new(resolver::Resolver::new(&config));

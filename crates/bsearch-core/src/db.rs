@@ -15,6 +15,7 @@ use jiff::Zoned;
 use crate::models::PendingImage;
 use crate::models::PendingLink;
 use crate::models::Post;
+use crate::models::PostImage;
 use crate::models::compose_image_text;
 use crate::models::created_at_sort_key;
 use crate::models::format_indexed_at;
@@ -222,17 +223,17 @@ fn insert_post_on(conn: &Connection, post: &Post) -> Result<Option<i64>> {
         return Ok(None);
     }
     let post_id = conn.last_insert_rowid();
-    insert_images_on(conn, post_id, post)?;
+    insert_images_on(conn, post_id, &post.images)?;
     Ok(Some(post_id))
 }
 
-/// Add the images of `post` to the recognition queue under `post_id`.
-fn insert_images_on(conn: &Connection, post_id: i64, post: &Post) -> Result<()> {
+/// Add `images` to the recognition queue under `post_id`.
+fn insert_images_on(conn: &Connection, post_id: i64, images: &[PostImage]) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO post_images (post_id, position, blob_cid, alt)
          VALUES (?1, ?2, ?3, ?4)",
     )?;
-    for (position, image) in post.images.iter().enumerate() {
+    for (position, image) in images.iter().enumerate() {
         stmt.execute(rusqlite::params![
             post_id,
             position as i64,
@@ -467,6 +468,58 @@ impl Database {
         let rows = stmt.query_map([since], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// URIs of all posts created on or after `since`, oldest first.
+    ///
+    /// `since` is compared as text, as in [`Self::liked_post_uris_since`];
+    /// an empty string selects every post.
+    pub fn post_uris_since(&self, since: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uri FROM posts WHERE created_at >= ?1 ORDER BY created_at")?;
+        let rows = stmt.query_map([since], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Record the images of a post indexed before images were recorded.
+    ///
+    /// The images are queued for text recognition, their alt text becomes
+    /// searchable at once, and the post's embedding is removed, so that it
+    /// is embedded again with its image text when recognition is done.
+    /// Returns `false`, changing nothing, if there is no post with this URI
+    /// or it already has images recorded.
+    pub fn add_images_to_post(&self, uri: &str, images: &[PostImage]) -> Result<bool> {
+        if images.is_empty() {
+            return Ok(false);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let post_id: Option<i64> = tx
+            .query_row("SELECT id FROM posts WHERE uri = ?1", [uri], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(post_id) = post_id else {
+            return Ok(false);
+        };
+        let recorded: i64 = tx.query_row(
+            "SELECT count(*) FROM post_images WHERE post_id = ?1",
+            [post_id],
+            |row| row.get(0),
+        )?;
+        if recorded > 0 {
+            return Ok(false);
+        }
+        insert_images_on(&tx, post_id, images)?;
+        refresh_image_text_on(&tx, post_id)?;
+        tx.execute("DELETE FROM vec_posts WHERE rowid = ?1", [post_id])?;
+        tx.execute(
+            "UPDATE posts SET has_embedding = 0 WHERE id = ?1",
+            [post_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// The oldest queued links, in the order they arrived.
@@ -1564,7 +1617,7 @@ mod tests {
         sample_post(uri, text).with_images(
             alts.iter()
                 .enumerate()
-                .map(|(i, alt)| crate::models::PostImage {
+                .map(|(i, alt)| PostImage {
                     blob_cid: format!("bafkrei{i}"),
                     alt: alt.to_string(),
                 })
@@ -1779,6 +1832,60 @@ mod tests {
             db.get_posts_without_embeddings(10).expect("query"),
             vec![(post_id, "MENU".to_string())]
         );
+    }
+
+    #[test]
+    fn test_add_images_to_post_queues_them_and_clears_the_embedding() {
+        let (_file, path) = empty_db();
+        let mut db = Database::open_read_write(&path).expect("open failed");
+        let post_id = db
+            .insert_post(&sample_post("at://uri/1", "caption"))
+            .expect("insert failed")
+            .expect("new post");
+        db.store_embeddings(&[(post_id, [0.1; 384])])
+            .expect("store failed");
+
+        let images = vec![PostImage {
+            blob_cid: "bafkreia".to_string(),
+            alt: "a gravestone".to_string(),
+        }];
+        assert!(db.add_images_to_post("at://uri/1", &images).expect("add"));
+
+        let results = db
+            .search_fts("gravestone", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(uris(&results), vec!["at://uri/1"]);
+        assert_eq!(db.count_pending_images().expect("count"), 1);
+        let vec_rows: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM vec_posts", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(vec_rows, 0, "the text-only embedding should be removed");
+
+        // Embedded again, with the image text, once recognition is done.
+        db.store_image_text(post_id, 0, "HERE LIES").expect("store");
+        assert_eq!(
+            db.get_posts_without_embeddings(10).expect("query"),
+            vec![(post_id, "caption\n\na gravestone\nHERE LIES".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_add_images_to_post_leaves_recorded_and_unknown_posts_alone() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.insert_post(&post_with_images("at://uri/1", "caption", &["alt"]))
+            .expect("insert failed");
+        let images = vec![PostImage {
+            blob_cid: "bafkreib".to_string(),
+            alt: "other".to_string(),
+        }];
+        assert!(!db.add_images_to_post("at://uri/1", &images).expect("add"));
+        assert!(
+            !db.add_images_to_post("at://uri/none", &images)
+                .expect("add")
+        );
+        assert_eq!(db.count_pending_images().expect("count"), 1);
     }
 
     #[test]
