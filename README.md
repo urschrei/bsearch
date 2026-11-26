@@ -24,12 +24,18 @@ same machine and model:
 | | Physical footprint |
 |---|---|
 | Python daemon (steady state, MPS) | 2586 MB |
-| Rust daemon, idle | 9-19 MB |
+| Rust daemon, idle | 9-20 MB |
 | Rust daemon, embedding a batch | ~70 MB |
+| Rust daemon, embedding while image text is read | ~110 MB |
+| Text recognition process, one image | 30-80 MB |
 
 The ONNX session is loaded only when there are posts to embed and dropped
 again after five minutes idle, which is what keeps the idle figure low;
-reloading takes well under a second.
+reloading takes well under a second. Text in images is read by a separate
+process for each image, which exits when the image is done, so its memory
+does not add to the daemon's idle figure. Its footprint depends on the
+image: a photo with a few words needs about 30 MB, a dense screenshot about
+80 MB.
 
 ## Setup
 
