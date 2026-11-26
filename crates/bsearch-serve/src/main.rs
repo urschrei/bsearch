@@ -9,6 +9,8 @@ mod links;
 mod ocr;
 mod resolver;
 
+use std::io::Read;
+use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +65,12 @@ enum Mode {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read an image on standard input and write the text in it to
+    /// standard output. The daemon runs this as a child process for each
+    /// image, so that the memory Vision allocates is released when the
+    /// child exits.
+    #[command(hide = true)]
+    RecogniseText,
 }
 
 fn parse_date(raw: &str) -> Result<Date, String> {
@@ -82,6 +90,14 @@ pub fn notify(title: &str, message: &str) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Mode::RecogniseText) = cli.mode {
+        let mut image = Vec::new();
+        std::io::stdin().read_to_end(&mut image)?;
+        let text = ocr::recognise_text(&image)?;
+        std::io::stdout().write_all(text.as_bytes())?;
+        return Ok(());
+    }
 
     // The dependency graph carries both rustls crypto providers (ring via
     // tokio-websockets, aws-lc-rs via its rustls-native-roots feature), and
@@ -118,6 +134,7 @@ async fn run(mode: Option<Mode>) -> Result<()> {
         Some(Mode::BackfillImages { since, dry_run }) => {
             return backfill_images::run(&config, since, dry_run).await;
         }
+        Some(Mode::RecogniseText) => unreachable!("handled before the runtime starts"),
         None => {}
     }
 

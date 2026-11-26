@@ -3,18 +3,25 @@
 //! Images are queued in `post_images` when their post is indexed. This loop
 //! fetches each one from the Bluesky CDN, recognises its text with Vision,
 //! and stores the text, which adds it to the post's searchable image text.
+//!
+//! Recognition runs in a child process, `bsearch-serve recognise-text`.
+//! Vision keeps its models in memory after use, about 140 MB, and the
+//! process that used it cannot release them; a child returns them to the
+//! system when it exits.
 
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use bsearch_core::db::Database;
 use bsearch_core::models::PendingImage;
 use reqwest::StatusCode;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-
-use crate::ocr;
 
 /// Full-size images, re-encoded as JPEG by the CDN. The path continues
 /// with the author's DID and the blob CID.
@@ -27,6 +34,9 @@ const MAX_ATTEMPTS: i64 = 5;
 /// How long to wait after the CDN is unreachable or reports an error.
 const RETRY_DELAY: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long recognition of one image may take. The first recognition after
+/// a new build takes about 40 seconds while Vision prepares its models.
+const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Why an image could not be fetched.
 #[derive(Debug, thiserror::Error)]
@@ -102,13 +112,56 @@ async fn process(client: &reqwest::Client, image: &PendingImage) -> Outcome {
         Err(e @ FetchError::Unavailable(_)) => return Outcome::FailedAndPause(e.into()),
         Err(e @ FetchError::Unreachable(_)) => return Outcome::Pause(e.into()),
     };
-    // Recognition is CPU-bound and blocks, so it runs on the blocking pool
-    // rather than on the single runtime thread.
-    match tokio::task::spawn_blocking(move || ocr::recognise_text(&bytes)).await {
-        Ok(Ok(text)) => Outcome::Done(text),
-        Ok(Err(e)) => Outcome::Failed(e),
-        Err(e) => Outcome::Failed(anyhow::anyhow!("text recognition task failed: {e}")),
+    match recognise_in_child(bytes).await {
+        Ok(text) => Outcome::Done(text),
+        Err(e) => Outcome::Failed(e),
     }
+}
+
+/// Recognise the text in an image by running this executable's
+/// `recognise-text` subcommand.
+async fn recognise_in_child(image: Vec<u8>) -> Result<String> {
+    let exe = std::env::current_exe().context("cannot find the running executable")?;
+    let mut command = Command::new(exe);
+    command.arg("recognise-text");
+    run_filter(command, image, RECOGNITION_TIMEOUT).await
+}
+
+/// Run `command` with `input` on its standard input, and return its
+/// standard output. The process is killed if it does not finish within
+/// `timeout`. A non-zero exit is an error that carries its standard error.
+async fn run_filter(mut command: Command, input: Vec<u8>, timeout: Duration) -> Result<String> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("cannot start the text recognition process")?;
+    let mut stdin = child.stdin.take().context("child has no standard input")?;
+
+    // The input is written while the output is read, so that neither
+    // process waits on a full pipe.
+    let write = async move {
+        stdin.write_all(&input).await?;
+        stdin.shutdown().await
+    };
+    let run = async { tokio::join!(write, child.wait_with_output()) };
+    // A failed write is not checked: a child that exits before reading all
+    // its input closes the pipe, and that matters only if the child also
+    // failed, which its exit status reports.
+    let (_written, output) = tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| anyhow::anyhow!("text recognition took longer than {timeout:?}"))?;
+    let output = output.context("text recognition process failed")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "text recognition process exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("recognised text is not UTF-8")
 }
 
 /// Periodically recognise the text in queued images.
@@ -205,6 +258,38 @@ fn record_failure(db: &Database, image: &PendingImage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_run_filter_returns_standard_output() {
+        let text = run_filter(
+            Command::new("cat"),
+            b"HERE LIES\nSTUMBLEUPON".to_vec(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("cat should succeed");
+        assert_eq!(text, "HERE LIES\nSTUMBLEUPON");
+    }
+
+    #[tokio::test]
+    async fn test_run_filter_reports_a_failed_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo 'not an image' >&2; exit 3"]);
+        let error = run_filter(command, Vec::new(), Duration::from_secs(10))
+            .await
+            .expect_err("a non-zero exit should be an error");
+        assert!(error.to_string().contains("not an image"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_run_filter_kills_a_child_that_overruns() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let error = run_filter(command, Vec::new(), Duration::from_millis(200))
+            .await
+            .expect_err("the child should time out");
+        assert!(error.to_string().contains("longer than"), "{error}");
+    }
 
     #[test]
     fn test_image_url_names_author_and_blob() {
