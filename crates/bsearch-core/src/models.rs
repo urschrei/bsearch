@@ -59,7 +59,7 @@ pub struct PostImage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingImage {
     pub post_id: i64,
-    /// The index of the image in the post's embed.
+    /// The index of the image among the post's recorded images.
     pub position: i64,
     pub author_did: String,
     pub blob_cid: String,

@@ -13,7 +13,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use anyhow::Result;
 use bsearch_core::db::Database;
 use bsearch_core::models::PendingImage;
@@ -59,14 +58,31 @@ enum FetchError {
 impl FetchError {
     fn from_status(status: StatusCode) -> Self {
         match status {
-            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::GONE => {
-                Self::Gone(status)
-            }
+            StatusCode::NOT_FOUND | StatusCode::GONE => Self::Gone(status),
             StatusCode::TOO_MANY_REQUESTS => Self::Unavailable(status),
             s if s.is_server_error() => Self::Unavailable(status),
             s => Self::Refused(s),
         }
     }
+}
+
+/// Why the text recognition process gave no text.
+#[derive(Debug, thiserror::Error)]
+enum RecogniseError {
+    /// The process could not be started or waited for.
+    #[error("cannot run the text recognition process: {0}")]
+    Start(std::io::Error),
+    #[error("text recognition took longer than {0:?}")]
+    TimedOut(Duration),
+    /// The process ended on a signal, for example after a crash.
+    #[error("text recognition process ended without an exit status")]
+    Killed,
+    /// The process reported an error, usually that Vision could not read
+    /// the image.
+    #[error("text recognition failed: {0}")]
+    Rejected(String),
+    #[error("recognised text is not UTF-8")]
+    NotUtf8,
 }
 
 /// What to do with an image after one attempt at it.
@@ -114,14 +130,22 @@ async fn process(client: &reqwest::Client, image: &PendingImage) -> Outcome {
     };
     match recognise_in_child(bytes).await {
         Ok(text) => Outcome::Done(text),
-        Err(e) => Outcome::Failed(e),
+        Err(e @ (RecogniseError::Rejected(_) | RecogniseError::NotUtf8)) => {
+            Outcome::Failed(e.into())
+        }
+        Err(e @ (RecogniseError::TimedOut(_) | RecogniseError::Killed)) => {
+            Outcome::FailedAndPause(e.into())
+        }
+        // Says nothing about the image: the executable may be in the middle
+        // of being replaced by a new build.
+        Err(e @ RecogniseError::Start(_)) => Outcome::Pause(e.into()),
     }
 }
 
 /// Recognise the text in an image by running this executable's
 /// `recognise-text` subcommand.
-async fn recognise_in_child(image: Vec<u8>) -> Result<String> {
-    let exe = std::env::current_exe().context("cannot find the running executable")?;
+async fn recognise_in_child(image: Vec<u8>) -> Result<String, RecogniseError> {
+    let exe = std::env::current_exe().map_err(RecogniseError::Start)?;
     let mut command = Command::new(exe);
     command.arg("recognise-text");
     run_filter(command, image, RECOGNITION_TIMEOUT).await
@@ -130,15 +154,22 @@ async fn recognise_in_child(image: Vec<u8>) -> Result<String> {
 /// Run `command` with `input` on its standard input, and return its
 /// standard output. The process is killed if it does not finish within
 /// `timeout`. A non-zero exit is an error that carries its standard error.
-async fn run_filter(mut command: Command, input: Vec<u8>, timeout: Duration) -> Result<String> {
+async fn run_filter(
+    mut command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+) -> Result<String, RecogniseError> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("cannot start the text recognition process")?;
-    let mut stdin = child.stdin.take().context("child has no standard input")?;
+        .map_err(RecogniseError::Start)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("standard input was configured as a pipe above");
 
     // The input is written while the output is read, so that neither
     // process waits on a full pipe.
@@ -152,16 +183,17 @@ async fn run_filter(mut command: Command, input: Vec<u8>, timeout: Duration) -> 
     // failed, which its exit status reports.
     let (_written, output) = tokio::time::timeout(timeout, run)
         .await
-        .map_err(|_| anyhow::anyhow!("text recognition took longer than {timeout:?}"))?;
-    let output = output.context("text recognition process failed")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "text recognition process exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        .map_err(|_| RecogniseError::TimedOut(timeout))?;
+    let output = output.map_err(RecogniseError::Start)?;
+    if output.status.code().is_none() {
+        return Err(RecogniseError::Killed);
     }
-    String::from_utf8(output.stdout).context("recognised text is not UTF-8")
+    if !output.status.success() {
+        return Err(RecogniseError::Rejected(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|_| RecogniseError::NotUtf8)
 }
 
 /// Periodically recognise the text in queued images.
@@ -209,22 +241,22 @@ pub async fn run(
                 break;
             }
             let outcome = process(&client, image).await;
-            let db = db.lock().await;
+            let guard = db.lock().await;
             let stored = match outcome {
                 Outcome::Done(text) => {
                     if !text.is_empty() {
                         recognised += 1;
                     }
-                    db.store_image_text(image.post_id, image.position, &text)
+                    guard.store_image_text(image, &text)
                 }
                 Outcome::Failed(e) => {
                     tracing::warn!(cid = %image.blob_cid, error = %e, "Failed to read image text");
-                    record_failure(&db, image)
+                    record_failure(&guard, image)
                 }
                 Outcome::FailedAndPause(e) => {
                     tracing::warn!(error = %e, "Image fetch failed; pausing");
                     pause = true;
-                    record_failure(&db, image)
+                    record_failure(&guard, image)
                 }
                 Outcome::Pause(e) => {
                     tracing::warn!(error = %e, "Image fetch failed; pausing");
@@ -249,7 +281,7 @@ pub async fn run(
 }
 
 fn record_failure(db: &Database, image: &PendingImage) -> Result<()> {
-    if db.record_image_failure(image.post_id, image.position, MAX_ATTEMPTS)? {
+    if db.record_image_failure(image, MAX_ATTEMPTS)? {
         tracing::warn!(cid = %image.blob_cid, "Giving up on image after {MAX_ATTEMPTS} attempts");
     }
     Ok(())
@@ -279,6 +311,29 @@ mod tests {
             .await
             .expect_err("a non-zero exit should be an error");
         assert!(error.to_string().contains("not an image"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_run_filter_reports_a_child_ended_by_a_signal() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "kill -9 $$"]);
+        let error = run_filter(command, Vec::new(), Duration::from_secs(10))
+            .await
+            .expect_err("a killed child should be an error");
+        assert!(
+            matches_killed(&error),
+            "expected the killed variant, got {error:?}"
+        );
+    }
+
+    fn matches_killed(error: &RecogniseError) -> bool {
+        match error {
+            RecogniseError::Killed => true,
+            RecogniseError::Start(_)
+            | RecogniseError::TimedOut(_)
+            | RecogniseError::Rejected(_)
+            | RecogniseError::NotUtf8 => false,
+        }
     }
 
     #[tokio::test]
@@ -317,11 +372,7 @@ mod tests {
 
     #[test]
     fn test_status_classification() {
-        for status in [
-            StatusCode::BAD_REQUEST,
-            StatusCode::NOT_FOUND,
-            StatusCode::GONE,
-        ] {
+        for status in [StatusCode::NOT_FOUND, StatusCode::GONE] {
             assert_eq!(classify(status), "gone", "{status}");
         }
         for status in [
@@ -331,6 +382,8 @@ mod tests {
         ] {
             assert_eq!(classify(status), "unavailable", "{status}");
         }
-        assert_eq!(classify(StatusCode::FORBIDDEN), "refused");
+        for status in [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN] {
+            assert_eq!(classify(status), "refused", "{status}");
+        }
     }
 }

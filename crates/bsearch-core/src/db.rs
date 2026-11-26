@@ -329,7 +329,11 @@ impl Database {
         Ok(db)
     }
 
+    /// Create or migrate the schema in one transaction, so that a reader
+    /// never sees a database between the image-text migration and the FTS
+    /// rebuild that follows it.
     fn init_schema(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         self.conn
             .execute_batch(SCHEMA_SQL)
             .context("failed to create base schema")?;
@@ -342,6 +346,7 @@ impl Database {
             .execute_batch(FTS_SCHEMA_SQL)
             .context("failed to create FTS schema")?;
         self.ensure_fts_populated()?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -353,15 +358,15 @@ impl Database {
     /// one-column `fts_posts` table and its triggers are dropped, and the
     /// initialisation flag is cleared: the FTS schema statements that run
     /// next create the two-column table, and [`Self::ensure_fts_populated`]
-    /// then rebuilds it from `posts`. If the process stops between the two
-    /// steps, the cleared flag causes the rebuild on the next start.
+    /// then rebuilds it from `posts`. [`Self::init_schema`] runs all of this
+    /// in one transaction.
     fn migrate_image_text(&self) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        if !has_column(&tx, "posts", "image_text")? {
-            tx.execute_batch("ALTER TABLE posts ADD COLUMN image_text TEXT NOT NULL DEFAULT ''")?;
+        let conn = &self.conn;
+        if !has_column(conn, "posts", "image_text")? {
+            conn.execute_batch("ALTER TABLE posts ADD COLUMN image_text TEXT NOT NULL DEFAULT ''")?;
         }
-        if table_exists(&tx, "fts_posts")? && !has_column(&tx, "fts_posts", "image_text")? {
-            tx.execute_batch(
+        if table_exists(conn, "fts_posts")? && !has_column(conn, "fts_posts", "image_text")? {
+            conn.execute_batch(
                 "DROP TRIGGER IF EXISTS posts_ai;
                  DROP TRIGGER IF EXISTS posts_ad;
                  DROP TRIGGER IF EXISTS posts_au;
@@ -369,7 +374,6 @@ impl Database {
                  DELETE FROM meta WHERE key = 'fts_initialized';",
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -597,39 +601,40 @@ impl Database {
     /// searchable image text to include it.
     ///
     /// An empty `text` marks the image as done with no text found.
-    pub fn store_image_text(&self, post_id: i64, position: i64, text: &str) -> Result<()> {
+    pub fn store_image_text(&self, image: &PendingImage, text: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE post_images SET ocr_text = ?3 WHERE post_id = ?1 AND position = ?2",
-            rusqlite::params![post_id, position, text],
+            rusqlite::params![image.post_id, image.position, text],
         )?;
-        refresh_image_text_on(&tx, post_id)?;
+        refresh_image_text_on(&tx, image.post_id)?;
         tx.commit()?;
         Ok(())
     }
 
     /// Count a failed attempt to recognise an image's text. After
     /// `max_attempts` failures the image is marked as done with no text, so
-    /// that it leaves the queue. Returns whether that happened.
-    pub fn record_image_failure(
-        &self,
-        post_id: i64,
-        position: i64,
-        max_attempts: i64,
-    ) -> Result<bool> {
+    /// that it leaves the queue. Returns whether that happened. An image
+    /// that is no longer queued, because its post was deleted, is ignored.
+    pub fn record_image_failure(&self, image: &PendingImage, max_attempts: i64) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        let attempts: i64 = tx.query_row(
-            "UPDATE post_images SET attempts = attempts + 1
-             WHERE post_id = ?1 AND position = ?2
-             RETURNING attempts",
-            [post_id, position],
-            |row| row.get(0),
-        )?;
+        let attempts: Option<i64> = tx
+            .query_row(
+                "UPDATE post_images SET attempts = attempts + 1
+                 WHERE post_id = ?1 AND position = ?2
+                 RETURNING attempts",
+                [image.post_id, image.position],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(attempts) = attempts else {
+            return Ok(false);
+        };
         let given_up = attempts >= max_attempts;
         if given_up {
             tx.execute(
                 "UPDATE post_images SET ocr_text = '' WHERE post_id = ?1 AND position = ?2",
-                [post_id, position],
+                [image.post_id, image.position],
             )?;
         }
         tx.commit()?;
@@ -667,9 +672,22 @@ impl Database {
     ///
     /// Runs as a single transaction so that `vec_posts` and `posts.has_embedding`
     /// cannot disagree if the process dies mid-batch.
+    ///
+    /// A post that has gained queued images since it was read for embedding
+    /// is skipped: its embedding lacks the image text, and the post is read
+    /// again once the images are done. `backfill-images` adds images to
+    /// posts from another process, while the daemon may be embedding them.
     pub fn store_embeddings(&mut self, embeddings: &[(i64, [f32; 384])]) -> Result<()> {
         let tx = self.conn.transaction()?;
         for (post_id, embedding) in embeddings {
+            let queued: i64 = tx.query_row(
+                "SELECT count(*) FROM post_images WHERE post_id = ?1 AND ocr_text IS NULL",
+                [post_id],
+                |row| row.get(0),
+            )?;
+            if queued > 0 {
+                continue;
+            }
             let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
             tx.execute(
                 "INSERT INTO vec_posts (rowid, embedding) VALUES (?1, ?2)",
@@ -1625,6 +1643,53 @@ mod tests {
         )
     }
 
+    /// The queue entry for an image of a post made by [`post_with_images`].
+    fn queued(post_id: i64, position: i64) -> PendingImage {
+        PendingImage {
+            post_id,
+            position,
+            author_did: "did:plc:abc".to_string(),
+            blob_cid: format!("bafkrei{position}"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_is_not_stored_for_a_post_that_gained_images() {
+        let (_file, path) = empty_db();
+        let mut db = Database::open_read_write(&path).expect("open failed");
+        let post_id = db
+            .insert_post(&sample_post("at://uri/1", "caption"))
+            .expect("insert failed")
+            .expect("new post");
+        // The embedding loop reads the post, then images are added before
+        // it stores the text-only embedding.
+        let pending = db.get_posts_without_embeddings(10).expect("query");
+        assert_eq!(pending.len(), 1);
+        let images = vec![PostImage {
+            blob_cid: "bafkreia".to_string(),
+            alt: String::new(),
+        }];
+        assert!(db.add_images_to_post("at://uri/1", &images).expect("add"));
+
+        db.store_embeddings(&[(post_id, [0.1; 384])])
+            .expect("store failed");
+
+        db.store_image_text(&queued(post_id, 0), "SIGN")
+            .expect("store");
+        assert_eq!(
+            db.get_posts_without_embeddings(10).expect("query"),
+            vec![(post_id, "caption\n\nSIGN".to_string())],
+            "the post must be embedded again with its image text"
+        );
+    }
+
+    #[test]
+    fn test_failure_of_an_image_no_longer_queued_is_ignored() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        assert!(!db.record_image_failure(&queued(99, 0), 2).expect("record"));
+    }
+
     /// The schema as it was before image text was indexed.
     const PRE_IMAGE_SCHEMA_SQL: &str = "
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -1736,7 +1801,7 @@ mod tests {
             ]
         );
 
-        db.store_image_text(post_id, 1, "QUARTERLY REPORT")
+        db.store_image_text(&queued(post_id, 1), "QUARTERLY REPORT")
             .expect("store failed");
 
         let results = db
@@ -1763,9 +1828,15 @@ mod tests {
             .expect("insert failed")
             .expect("new post");
 
-        assert!(!db.record_image_failure(post_id, 0, 2).expect("first"));
+        assert!(
+            !db.record_image_failure(&queued(post_id, 0), 2)
+                .expect("first")
+        );
         assert_eq!(db.count_pending_images().expect("count"), 1);
-        assert!(db.record_image_failure(post_id, 0, 2).expect("second"));
+        assert!(
+            db.record_image_failure(&queued(post_id, 0), 2)
+                .expect("second")
+        );
         assert_eq!(db.count_pending_images().expect("count"), 0);
     }
 
@@ -1794,7 +1865,7 @@ mod tests {
             "the post must not be embedded while its image is queued"
         );
 
-        db.store_image_text(post_id, 0, "SIGN TEXT")
+        db.store_image_text(&queued(post_id, 0), "SIGN TEXT")
             .expect("store failed");
         assert_eq!(
             db.get_posts_without_embeddings(10).expect("query"),
@@ -1810,7 +1881,8 @@ mod tests {
             .insert_post(&post_with_images("at://uri/1", "", &[""]))
             .expect("insert failed")
             .expect("new post");
-        db.store_image_text(post_id, 0, "").expect("store failed");
+        db.store_image_text(&queued(post_id, 0), "")
+            .expect("store failed");
         assert!(
             db.get_posts_without_embeddings(10)
                 .expect("query")
@@ -1826,7 +1898,7 @@ mod tests {
             .insert_post(&post_with_images("at://uri/1", "", &[""]))
             .expect("insert failed")
             .expect("new post");
-        db.store_image_text(post_id, 0, "MENU")
+        db.store_image_text(&queued(post_id, 0), "MENU")
             .expect("store failed");
         assert_eq!(
             db.get_posts_without_embeddings(10).expect("query"),
@@ -1863,7 +1935,8 @@ mod tests {
         assert_eq!(vec_rows, 0, "the text-only embedding should be removed");
 
         // Embedded again, with the image text, once recognition is done.
-        db.store_image_text(post_id, 0, "HERE LIES").expect("store");
+        db.store_image_text(&queued(post_id, 0), "HERE LIES")
+            .expect("store");
         assert_eq!(
             db.get_posts_without_embeddings(10).expect("query"),
             vec![(post_id, "caption\n\na gravestone\nHERE LIES".to_string())]
