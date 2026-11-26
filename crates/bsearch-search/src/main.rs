@@ -183,6 +183,21 @@ fn print_result(index: usize, r: &db::SearchResult) {
     println!("{}  {}", "Source:".dimmed(), r.source.magenta());
     println!("{}  {}", "Link:".dimmed(), web_url.blue().underline());
     println!("{}  {}", "Text:".dimmed(), r.text);
+    if !r.image_text.is_empty() {
+        println!(
+            "{}  {}",
+            "Images:".dimmed(),
+            indent_continuation_lines(&r.image_text, "         ")
+        );
+    }
+}
+
+/// Indent every line of `text` after the first by `indent`, so that a
+/// multi-line value lines up under its label.
+fn indent_continuation_lines(text: &str, indent: &str) -> String {
+    text.lines()
+        .collect::<Vec<_>>()
+        .join(&format!("\n{indent}"))
 }
 
 fn at_uri_to_web_url(uri: &str) -> String {
@@ -208,6 +223,15 @@ mod tests {
             at_uri_to_web_url("at://did:plc:abc/app.bsky.feed.post/rkey123"),
             "https://bsky.app/profile/did:plc:abc/post/rkey123"
         );
+    }
+
+    #[test]
+    fn test_indent_continuation_lines() {
+        assert_eq!(
+            indent_continuation_lines("HERE LIES\nSTUMBLEUPON", "  "),
+            "HERE LIES\n  STUMBLEUPON"
+        );
+        assert_eq!(indent_continuation_lines("one line", "  "), "one line");
     }
 
     #[test]
