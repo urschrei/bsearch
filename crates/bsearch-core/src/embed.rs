@@ -7,6 +7,11 @@ use ndarray::Array2;
 use ort::session::Session;
 use ort::value::Tensor;
 
+/// The longest input, in tokens, that the model reads. Longer input is
+/// truncated. The value is `max_seq_length` of all-MiniLM-L6-v2 in
+/// sentence-transformers, so this agrees with the Python embeddings.
+const MAX_SEQUENCE_LENGTH: usize = 256;
+
 /// Loads an ONNX model and tokenizer, then uses them to encode text into
 /// 384-dimensional embeddings.
 pub struct Embedder {
@@ -42,8 +47,16 @@ impl Embedder {
             .commit_from_file(&model_path)
             .with_context(|| format!("Failed to load ONNX model from {}", model_path.display()))?;
 
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        // The exported tokenizer does not truncate, and the model cannot
+        // read past its position embeddings.
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: MAX_SEQUENCE_LENGTH,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("Failed to set tokenizer truncation: {e}"))?;
 
         Ok(Embedder { session, tokenizer })
     }
