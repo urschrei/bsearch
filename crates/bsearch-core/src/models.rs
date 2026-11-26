@@ -41,10 +41,47 @@ pub struct Post {
     pub created_at: String,
     pub source: &'static str,
     pub indexed_at: String,
+    /// The images the post embeds, in the order the post shows them.
+    pub images: Vec<PostImage>,
+}
+
+/// An image embedded in a post. Stored in `post_images`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostImage {
+    /// The CID of the image blob, which together with the author's DID
+    /// identifies the image file.
+    pub blob_cid: String,
+    /// The alt text the author wrote, or an empty string.
+    pub alt: String,
+}
+
+/// An image whose text has not been recognised yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingImage {
+    pub post_id: i64,
+    /// The index of the image in the post's embed.
+    pub position: i64,
+    pub author_did: String,
+    pub blob_cid: String,
+}
+
+/// Join the alt text and recognised text of a post's images into the single
+/// value stored in `posts.image_text`.
+///
+/// `parts` gives each image's alt text and recognised text, in image order.
+/// Empty parts are left out.
+pub fn compose_image_text<'a>(parts: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    parts
+        .into_iter()
+        .flat_map(|(alt, recognised)| [alt.trim(), recognised.trim()])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl Post {
-    /// Build a post, stamping `indexed_at` with the current local time.
+    /// Build a post without images, stamping `indexed_at` with the current
+    /// local time.
     pub fn new(
         uri: String,
         cid: String,
@@ -63,7 +100,19 @@ impl Post {
             created_at,
             source: source.as_str(),
             indexed_at: format_indexed_at(Zoned::now().datetime()),
+            images: Vec::new(),
         }
+    }
+
+    /// Attach the images the post embeds.
+    pub fn with_images(mut self, images: Vec<PostImage>) -> Self {
+        self.images = images;
+        self
+    }
+
+    /// The image text known before any recognition: the alt text alone.
+    pub fn initial_image_text(&self) -> String {
+        compose_image_text(self.images.iter().map(|image| (image.alt.as_str(), "")))
     }
 }
 
@@ -242,6 +291,40 @@ mod tests {
         let zdt = parse_rfc3339("2026-03-29T03:11:21.467123+01:00").unwrap();
         let key = created_at_sort_key(&format_created_at(&zdt)).unwrap();
         assert_eq!(key, zdt.timestamp());
+    }
+
+    #[test]
+    fn test_compose_image_text_keeps_image_order_and_drops_empty_parts() {
+        let text = compose_image_text([
+            ("A ferret in a sock", "SOCK THIEF"),
+            ("", ""),
+            ("  ", "Quarterly report"),
+        ]);
+        assert_eq!(text, "A ferret in a sock\nSOCK THIEF\nQuarterly report");
+    }
+
+    #[test]
+    fn test_initial_image_text_is_alt_text_only() {
+        let post = Post::new(
+            "at://uri/1".to_string(),
+            "cid".to_string(),
+            "did:plc:abc".to_string(),
+            "alice.bsky.social".to_string(),
+            String::new(),
+            "2026-03-29T03:11:21.467000+00:00".to_string(),
+            Source::OwnPost,
+        )
+        .with_images(vec![
+            PostImage {
+                blob_cid: "bafkrei1".to_string(),
+                alt: "first".to_string(),
+            },
+            PostImage {
+                blob_cid: "bafkrei2".to_string(),
+                alt: String::new(),
+            },
+        ]);
+        assert_eq!(post.initial_image_text(), "first");
     }
 
     #[test]

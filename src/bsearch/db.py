@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS posts (
     created_at TEXT NOT NULL,
     source TEXT NOT NULL,
     indexed_at TEXT NOT NULL,
-    has_embedding INTEGER NOT NULL DEFAULT 0
+    has_embedding INTEGER NOT NULL DEFAULT 0,
+    image_text TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_source ON posts(source);
@@ -53,6 +54,19 @@ CREATE TABLE IF NOT EXISTS pending_links (
     description TEXT NOT NULL,
     queued_at TEXT NOT NULL
 );
+
+-- Images embedded in posts, awaiting or holding recognised text. Filled and
+-- drained by the Rust daemon, which also migrates older databases to this
+-- schema; declared here for the same reason as above.
+CREATE TABLE IF NOT EXISTS post_images (
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    blob_cid TEXT NOT NULL,
+    alt TEXT NOT NULL,
+    ocr_text TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (post_id, position)
+);
 """
 
 VEC_TABLE_SQL = """
@@ -64,22 +78,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_posts USING vec0(
 FTS_SCHEMA_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_posts USING fts5(
     text,
+    image_text,
     content=posts,
     content_rowid=id,
     tokenize='porter unicode61'
 );
 
 CREATE TRIGGER IF NOT EXISTS posts_ai AFTER INSERT ON posts BEGIN
-    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+    INSERT INTO fts_posts(rowid, text, image_text)
+    VALUES (new.id, new.text, new.image_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS posts_ad AFTER DELETE ON posts BEGIN
-    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
+    INSERT INTO fts_posts(fts_posts, rowid, text, image_text)
+    VALUES('delete', old.id, old.text, old.image_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS posts_au AFTER UPDATE ON posts BEGIN
-    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
-    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+    INSERT INTO fts_posts(fts_posts, rowid, text, image_text)
+    VALUES('delete', old.id, old.text, old.image_text);
+    INSERT INTO fts_posts(rowid, text, image_text)
+    VALUES (new.id, new.text, new.image_text);
 END;
 """
 

@@ -12,8 +12,10 @@ use rusqlite::OptionalExtension;
 
 use jiff::Zoned;
 
+use crate::models::PendingImage;
 use crate::models::PendingLink;
 use crate::models::Post;
+use crate::models::compose_image_text;
 use crate::models::created_at_sort_key;
 use crate::models::format_indexed_at;
 
@@ -36,7 +38,8 @@ CREATE TABLE IF NOT EXISTS posts (
     created_at TEXT NOT NULL,
     source TEXT NOT NULL,
     indexed_at TEXT NOT NULL,
-    has_embedding INTEGER NOT NULL DEFAULT 0
+    has_embedding INTEGER NOT NULL DEFAULT 0,
+    image_text TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_source ON posts(source);
@@ -54,6 +57,16 @@ CREATE TABLE IF NOT EXISTS pending_links (
     description TEXT NOT NULL,
     queued_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS post_images (
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    blob_cid TEXT NOT NULL,
+    alt TEXT NOT NULL,
+    ocr_text TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (post_id, position)
+);
 ";
 
 const VEC_TABLE_SQL: &str = "
@@ -65,22 +78,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_posts USING vec0(
 const FTS_SCHEMA_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_posts USING fts5(
     text,
+    image_text,
     content=posts,
     content_rowid=id,
     tokenize='porter unicode61'
 );
 
 CREATE TRIGGER IF NOT EXISTS posts_ai AFTER INSERT ON posts BEGIN
-    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+    INSERT INTO fts_posts(rowid, text, image_text)
+    VALUES (new.id, new.text, new.image_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS posts_ad AFTER DELETE ON posts BEGIN
-    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
+    INSERT INTO fts_posts(fts_posts, rowid, text, image_text)
+    VALUES('delete', old.id, old.text, old.image_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS posts_au AFTER UPDATE ON posts BEGIN
-    INSERT INTO fts_posts(fts_posts, rowid, text) VALUES('delete', old.id, old.text);
-    INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+    INSERT INTO fts_posts(fts_posts, rowid, text, image_text)
+    VALUES('delete', old.id, old.text, old.image_text);
+    INSERT INTO fts_posts(rowid, text, image_text)
+    VALUES (new.id, new.text, new.image_text);
 END;
 ";
 
@@ -145,6 +163,8 @@ pub struct SearchResult {
     pub created_at: String,
     pub source: String,
     pub indexed_at: String,
+    /// The alt text and recognised text of the post's images.
+    pub image_text: String,
     pub distance: Option<f64>,
     pub bm25_rank: Option<f64>,
     pub rrf_score: Option<f64>,
@@ -177,12 +197,14 @@ fn queue_links_on(conn: &Connection, links: &[PendingLink]) -> Result<usize> {
     Ok(queued)
 }
 
-/// Insert a post through `conn`, which may be a transaction.
+/// Insert a post and its images through `conn`, which must be a
+/// transaction so that the post and its images are written together.
 fn insert_post_on(conn: &Connection, post: &Post) -> Result<Option<i64>> {
     let changed = conn.execute(
         "INSERT OR IGNORE INTO posts
-             (uri, cid, author_did, author_handle, text, created_at, source, indexed_at, has_embedding)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+             (uri, cid, author_did, author_handle, text, created_at, source, indexed_at,
+              has_embedding, image_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
         rusqlite::params![
             post.uri,
             post.cid,
@@ -192,13 +214,78 @@ fn insert_post_on(conn: &Connection, post: &Post) -> Result<Option<i64>> {
             post.created_at,
             post.source,
             post.indexed_at,
+            post.initial_image_text(),
         ],
     )?;
 
     if changed == 0 {
         return Ok(None);
     }
-    Ok(Some(conn.last_insert_rowid()))
+    let post_id = conn.last_insert_rowid();
+    insert_images_on(conn, post_id, post)?;
+    Ok(Some(post_id))
+}
+
+/// Add the images of `post` to the recognition queue under `post_id`.
+fn insert_images_on(conn: &Connection, post_id: i64, post: &Post) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO post_images (post_id, position, blob_cid, alt)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (position, image) in post.images.iter().enumerate() {
+        stmt.execute(rusqlite::params![
+            post_id,
+            position as i64,
+            image.blob_cid,
+            image.alt
+        ])?;
+    }
+    Ok(())
+}
+
+/// Recompute `posts.image_text` for one post from its images.
+///
+/// The row is written only when the value changes, because each write to
+/// `posts` also re-indexes the post for full-text search.
+fn refresh_image_text_on(conn: &Connection, post_id: i64) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT alt, coalesce(ocr_text, '') FROM post_images
+         WHERE post_id = ?1 ORDER BY position",
+    )?;
+    let parts = stmt
+        .query_map([post_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let image_text = compose_image_text(
+        parts
+            .iter()
+            .map(|(alt, recognised)| (alt.as_str(), recognised.as_str())),
+    );
+    conn.execute(
+        "UPDATE posts SET image_text = ?2 WHERE id = ?1 AND image_text != ?2",
+        rusqlite::params![post_id, image_text],
+    )?;
+    Ok(())
+}
+
+/// Whether `table` has a column called `column`. Works for virtual tables.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        [table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 impl Database {
@@ -235,6 +322,8 @@ impl Database {
         self.conn
             .execute_batch(SCHEMA_SQL)
             .context("failed to create base schema")?;
+        self.migrate_image_text()
+            .context("failed to add image text to the schema")?;
         self.conn
             .execute_batch(VEC_TABLE_SQL)
             .context("failed to create vec_posts table")?;
@@ -242,6 +331,34 @@ impl Database {
             .execute_batch(FTS_SCHEMA_SQL)
             .context("failed to create FTS schema")?;
         self.ensure_fts_populated()?;
+        Ok(())
+    }
+
+    /// Bring a database created before image text was indexed up to the
+    /// current schema.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does not change a table that exists, so
+    /// an older `posts` table gets its `image_text` column here. An older
+    /// one-column `fts_posts` table and its triggers are dropped, and the
+    /// initialisation flag is cleared: the FTS schema statements that run
+    /// next create the two-column table, and [`Self::ensure_fts_populated`]
+    /// then rebuilds it from `posts`. If the process stops between the two
+    /// steps, the cleared flag causes the rebuild on the next start.
+    fn migrate_image_text(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if !has_column(&tx, "posts", "image_text")? {
+            tx.execute_batch("ALTER TABLE posts ADD COLUMN image_text TEXT NOT NULL DEFAULT ''")?;
+        }
+        if table_exists(&tx, "fts_posts")? && !has_column(&tx, "fts_posts", "image_text")? {
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS posts_ai;
+                 DROP TRIGGER IF EXISTS posts_ad;
+                 DROP TRIGGER IF EXISTS posts_au;
+                 DROP TABLE fts_posts;
+                 DELETE FROM meta WHERE key = 'fts_initialized';",
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -281,12 +398,16 @@ impl Database {
         Ok(())
     }
 
-    /// Insert a post, returning its rowid, or `None` if the URI already exists.
+    /// Insert a post and its images, returning its rowid, or `None` if the
+    /// URI already exists.
     ///
     /// The FTS index is maintained by the `posts_ai` trigger, so no separate
     /// write is needed here.
     pub fn insert_post(&self, post: &Post) -> Result<Option<i64>> {
-        insert_post_on(&self.conn, post)
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = insert_post_on(&tx, post)?;
+        tx.commit()?;
+        Ok(inserted)
     }
 
     /// Insert a post and, if it was new, queue the links it carries for
@@ -371,6 +492,85 @@ impl Database {
         self.conn
             .query_row("SELECT count(*) FROM pending_links", [], |row| row.get(0))
             .map_err(Into::into)
+    }
+
+    /// The oldest images whose text has not been recognised yet.
+    ///
+    /// Read rather than removed; call [`Self::store_image_text`] or
+    /// [`Self::record_image_failure`] once an image has been dealt with.
+    pub fn take_pending_images(&self, limit: usize) -> Result<Vec<PendingImage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.post_id, i.position, p.author_did, i.blob_cid
+             FROM post_images i
+             INNER JOIN posts p ON p.id = i.post_id
+             WHERE i.ocr_text IS NULL
+             ORDER BY i.rowid
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(PendingImage {
+                post_id: row.get(0)?,
+                position: row.get(1)?,
+                author_did: row.get(2)?,
+                blob_cid: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// How many images are waiting for text recognition.
+    pub fn count_pending_images(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM post_images WHERE ocr_text IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Store the text recognised in an image, and update the post's
+    /// searchable image text to include it.
+    ///
+    /// An empty `text` marks the image as done with no text found.
+    pub fn store_image_text(&self, post_id: i64, position: i64, text: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE post_images SET ocr_text = ?3 WHERE post_id = ?1 AND position = ?2",
+            rusqlite::params![post_id, position, text],
+        )?;
+        refresh_image_text_on(&tx, post_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count a failed attempt to recognise an image's text. After
+    /// `max_attempts` failures the image is marked as done with no text, so
+    /// that it leaves the queue. Returns whether that happened.
+    pub fn record_image_failure(
+        &self,
+        post_id: i64,
+        position: i64,
+        max_attempts: i64,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let attempts: i64 = tx.query_row(
+            "UPDATE post_images SET attempts = attempts + 1
+             WHERE post_id = ?1 AND position = ?2
+             RETURNING attempts",
+            [post_id, position],
+            |row| row.get(0),
+        )?;
+        let given_up = attempts >= max_attempts;
+        if given_up {
+            tx.execute(
+                "UPDATE post_images SET ocr_text = '' WHERE post_id = ?1 AND position = ?2",
+                [post_id, position],
+            )?;
+        }
+        tx.commit()?;
+        Ok(given_up)
     }
 
     /// Return `(id, text)` for posts that still need an embedding.
@@ -551,7 +751,7 @@ impl Database {
         let sql = format!(
             "SELECT p.id, fts_posts.rank AS bm25_rank,
                     p.uri, p.cid, p.author_did, p.author_handle, p.text,
-                    p.created_at, p.source, p.indexed_at
+                    p.created_at, p.source, p.indexed_at, p.image_text
              FROM fts_posts
              INNER JOIN posts p ON p.id = fts_posts.rowid
              WHERE {}
@@ -586,6 +786,7 @@ impl Database {
                 created_at: row.get(7)?,
                 source: row.get(8)?,
                 indexed_at: row.get(9)?,
+                image_text: row.get(10)?,
                 distance: None,
                 rrf_score: None,
                 match_type: Some(MatchType::Keyword),
@@ -629,7 +830,7 @@ impl Database {
             .collect();
 
         let sql = "SELECT v.rowid AS id, v.distance, p.uri, p.cid, p.author_did, p.author_handle,
-                          p.text, p.created_at, p.source, p.indexed_at
+                          p.text, p.created_at, p.source, p.indexed_at, p.image_text
                    FROM vec_posts v
                    INNER JOIN posts p ON p.id = v.rowid
                    WHERE v.embedding MATCH ?1 AND k = ?2
@@ -650,6 +851,7 @@ impl Database {
                     created_at: row.get(7)?,
                     source: row.get(8)?,
                     indexed_at: row.get(9)?,
+                    image_text: row.get(10)?,
                     bm25_rank: None,
                     rrf_score: None,
                     match_type: Some(MatchType::Semantic),
@@ -838,14 +1040,14 @@ impl Database {
     ) -> Result<Vec<SearchResult>> {
         let sql = if source_filter.is_some() {
             "SELECT p.id, p.uri, p.cid, p.author_did, p.author_handle, p.text,
-                    p.created_at, p.source, p.indexed_at
+                    p.created_at, p.source, p.indexed_at, p.image_text
              FROM posts p
              WHERE p.author_handle = ?1 AND p.source = ?2
              ORDER BY p.created_at DESC
              LIMIT ?3"
         } else {
             "SELECT p.id, p.uri, p.cid, p.author_did, p.author_handle, p.text,
-                    p.created_at, p.source, p.indexed_at
+                    p.created_at, p.source, p.indexed_at, p.image_text
              FROM posts p
              WHERE p.author_handle = ?1
              ORDER BY p.created_at DESC
@@ -865,6 +1067,7 @@ impl Database {
                 created_at: row.get(6)?,
                 source: row.get(7)?,
                 indexed_at: row.get(8)?,
+                image_text: row.get(9)?,
                 distance: None,
                 bm25_rank: None,
                 rrf_score: None,
@@ -929,19 +1132,21 @@ mod tests {
                 text        TEXT NOT NULL DEFAULT '',
                 created_at  TEXT NOT NULL DEFAULT '',
                 source      TEXT NOT NULL DEFAULT '',
-                indexed_at  TEXT NOT NULL DEFAULT ''
+                indexed_at  TEXT NOT NULL DEFAULT '',
+                image_text  TEXT NOT NULL DEFAULT ''
             );
 
             CREATE VIRTUAL TABLE fts_posts USING fts5(
                 text,
+                image_text,
                 content=posts,
                 content_rowid=id,
                 tokenize='porter unicode61'
             );
 
             CREATE TRIGGER posts_ai AFTER INSERT ON posts BEGIN
-                INSERT INTO fts_posts(rowid, text)
-                VALUES (new.id, new.text);
+                INSERT INTO fts_posts(rowid, text, image_text)
+                VALUES (new.id, new.text, new.image_text);
             END;",
         )
         .expect("failed to create schema");
@@ -1255,6 +1460,7 @@ mod tests {
             "index sqlite_autoindex_meta_1",
             "index sqlite_autoindex_pending_likes_1",
             "index sqlite_autoindex_pending_links_1",
+            "index sqlite_autoindex_post_images_1",
             "index sqlite_autoindex_posts_1",
             "index sqlite_autoindex_vec_posts_info_1",
             "index sqlite_autoindex_vec_posts_vector_chunks00_1",
@@ -1266,6 +1472,7 @@ mod tests {
             "table meta",
             "table pending_likes",
             "table pending_links",
+            "table post_images",
             "table posts",
             "table sqlite_sequence",
             "table vec_posts",
@@ -1324,6 +1531,172 @@ mod tests {
             .expect("search failed");
         assert_eq!(results.len(), 1, "trigger should have indexed the post");
         assert_eq!(results[0].uri, "at://uri/1");
+    }
+
+    fn post_with_images(uri: &str, text: &str, alts: &[&str]) -> Post {
+        sample_post(uri, text).with_images(
+            alts.iter()
+                .enumerate()
+                .map(|(i, alt)| crate::models::PostImage {
+                    blob_cid: format!("bafkrei{i}"),
+                    alt: alt.to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The schema as it was before image text was indexed.
+    const PRE_IMAGE_SCHEMA_SQL: &str = "
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uri TEXT UNIQUE NOT NULL,
+            cid TEXT NOT NULL,
+            author_did TEXT NOT NULL,
+            author_handle TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            indexed_at TEXT NOT NULL,
+            has_embedding INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE VIRTUAL TABLE fts_posts USING fts5(
+            text, content=posts, content_rowid=id, tokenize='porter unicode61'
+        );
+        CREATE TRIGGER posts_ai AFTER INSERT ON posts BEGIN
+            INSERT INTO fts_posts(rowid, text) VALUES (new.id, new.text);
+        END;
+        INSERT INTO meta (key, value) VALUES ('fts_initialized', '1');
+        INSERT INTO posts (uri, cid, author_did, author_handle, text, created_at, source, indexed_at)
+        VALUES ('at://uri/old', 'cid', 'did:plc:abc', 'alice.bsky.social',
+                'an older post about otters', '2024-01-01T00:00:00+00:00', 'own_post',
+                '2024-01-01T00:00:00');
+    ";
+
+    #[test]
+    fn test_pre_image_database_is_migrated_and_reindexed() {
+        let (_file, path) = empty_db();
+        Connection::open(&path)
+            .expect("open failed")
+            .execute_batch(PRE_IMAGE_SCHEMA_SQL)
+            .expect("failed to create the old schema");
+
+        let db = Database::open_read_write(&path).expect("migration failed");
+        assert!(has_column(&db.conn, "posts", "image_text").expect("pragma"));
+        assert!(has_column(&db.conn, "fts_posts", "image_text").expect("pragma"));
+
+        // The rebuilt index still holds the post written before migration.
+        let results = db
+            .search_fts("otters", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(uris(&results), vec!["at://uri/old"]);
+
+        // Posts written after migration are indexed by the new triggers.
+        db.insert_post(&post_with_images("at://uri/new", "", &["a heron"]))
+            .expect("insert failed");
+        let results = db
+            .search_fts("heron", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(uris(&results), vec!["at://uri/new"]);
+        drop(db);
+
+        // A second open finds nothing left to migrate.
+        Database::open_read_write(&path).expect("reopen failed");
+    }
+
+    #[test]
+    fn test_alt_text_is_searchable_on_insert() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        db.insert_post(&post_with_images(
+            "at://uri/1",
+            "look at this",
+            &["A ferret asleep in a sock drawer", ""],
+        ))
+        .expect("insert failed");
+
+        let results = db
+            .search_fts("ferret", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "look at this");
+        assert_eq!(results[0].image_text, "A ferret asleep in a sock drawer");
+        assert_eq!(db.count_pending_images().expect("count"), 2);
+    }
+
+    #[test]
+    fn test_stored_image_text_is_searchable() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let post_id = db
+            .insert_post(&post_with_images(
+                "at://uri/1",
+                "",
+                &["first image", "second image"],
+            ))
+            .expect("insert failed")
+            .expect("new post");
+
+        let pending = db.take_pending_images(10).expect("queue");
+        assert_eq!(
+            pending,
+            vec![
+                PendingImage {
+                    post_id,
+                    position: 0,
+                    author_did: "did:plc:abc".to_string(),
+                    blob_cid: "bafkrei0".to_string(),
+                },
+                PendingImage {
+                    post_id,
+                    position: 1,
+                    author_did: "did:plc:abc".to_string(),
+                    blob_cid: "bafkrei1".to_string(),
+                },
+            ]
+        );
+
+        db.store_image_text(post_id, 1, "QUARTERLY REPORT")
+            .expect("store failed");
+
+        let results = db
+            .search_fts("quarterly", 10, None, None, Order::Relevance)
+            .expect("search failed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].image_text,
+            "first image\nsecond image\nQUARTERLY REPORT"
+        );
+        assert_eq!(
+            db.take_pending_images(10).expect("queue").len(),
+            1,
+            "only the image without text should remain queued"
+        );
+    }
+
+    #[test]
+    fn test_image_leaves_queue_after_max_failures() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let post_id = db
+            .insert_post(&post_with_images("at://uri/1", "text", &["alt"]))
+            .expect("insert failed")
+            .expect("new post");
+
+        assert!(!db.record_image_failure(post_id, 0, 2).expect("first"));
+        assert_eq!(db.count_pending_images().expect("count"), 1);
+        assert!(db.record_image_failure(post_id, 0, 2).expect("second"));
+        assert_eq!(db.count_pending_images().expect("count"), 0);
+    }
+
+    #[test]
+    fn test_duplicate_post_does_not_queue_images_again() {
+        let (_file, path) = empty_db();
+        let db = Database::open_read_write(&path).expect("open failed");
+        let post = post_with_images("at://uri/1", "text", &["alt"]);
+        db.insert_post(&post).expect("first");
+        db.insert_post(&post).expect("replay");
+        assert_eq!(db.count_pending_images().expect("count"), 1);
     }
 
     #[test]
